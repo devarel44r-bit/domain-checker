@@ -2621,3 +2621,335 @@ st.caption(
     "proteksi terhadap localhost, jaringan private/internal, link-local, reserved IP, "
     "custom port, dan redirect menuju target non-public."
 )
+
+# =========================================================
+# AUTHORITY / BACKLINK METRICS (ADDED ONLY - EXISTING CODE ABOVE UNCHANGED)
+# =========================================================
+
+def _get_streamlit_secret(name):
+    try:
+        value = st.secrets[name]
+        return str(value).strip() if value is not None else None
+    except Exception:
+        return None
+
+
+def _authority_metric_value(value):
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
+def check_moz_authority(domain: str):
+    """
+    Moz Links API v2:
+    - Domain Authority (DA)
+    - Page Authority (PA)
+    - Spam Score
+
+    Streamlit Secrets:
+    MOZ_ACCESS_ID
+    MOZ_SECRET_KEY
+    """
+    result = {
+        "domain_authority": None,
+        "page_authority": None,
+        "spam_score": None,
+        "error": None,
+    }
+
+    access_id = _get_streamlit_secret("MOZ_ACCESS_ID")
+    secret_key = _get_streamlit_secret("MOZ_SECRET_KEY")
+
+    if not access_id or not secret_key:
+        result["error"] = "MOZ_ACCESS_ID / MOZ_SECRET_KEY belum dikonfigurasi di Streamlit Secrets."
+        return result
+
+    try:
+        validate_public_target(domain)
+
+        response = requests.post(
+            "https://lsapi.seomoz.com/v2/url_metrics",
+            auth=(access_id, secret_key),
+            json={"targets": [domain]},
+            headers={"Accept": "application/json"},
+            timeout=TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            result["error"] = f"Moz API HTTP {response.status_code}"
+            return result
+
+        payload = response.json()
+        rows = payload.get("results") or []
+
+        if not rows:
+            result["error"] = "Moz API tidak mengembalikan metrics untuk domain ini."
+            return result
+
+        row = rows[0] or {}
+        result["domain_authority"] = row.get("domain_authority")
+        result["page_authority"] = row.get("page_authority")
+        result["spam_score"] = row.get("spam_score")
+
+    except requests.RequestException as exc:
+        result["error"] = f"Moz request error: {exc}"
+    except Exception as exc:
+        result["error"] = f"Moz error: {exc}"
+
+    return result
+
+
+def check_majestic_authority(domain: str):
+    """
+    Majestic GetIndexItemInfo:
+    - Trust Flow (TF)
+    - Citation Flow (CF)
+    - TF/CF Ratio
+    - Referring Domains
+    - External Backlinks
+
+    Streamlit Secrets:
+    MAJESTIC_API_KEY
+    """
+    result = {
+        "trust_flow": None,
+        "citation_flow": None,
+        "tf_cf_ratio": None,
+        "referring_domains": None,
+        "backlinks": None,
+        "status": None,
+        "error": None,
+    }
+
+    api_key = _get_streamlit_secret("MAJESTIC_API_KEY")
+
+    if not api_key:
+        result["error"] = "MAJESTIC_API_KEY belum dikonfigurasi di Streamlit Secrets."
+        return result
+
+    try:
+        validate_public_target(domain)
+
+        response = requests.get(
+            "https://api.majestic.com/api/json",
+            params={
+                "app_api_key": api_key,
+                "cmd": "GetIndexItemInfo",
+                "items": 1,
+                "item0": domain,
+                "datasource": "fresh",
+            },
+            headers={"Accept": "application/json"},
+            timeout=TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            result["error"] = f"Majestic API HTTP {response.status_code}"
+            return result
+
+        payload = response.json()
+
+        if payload.get("Code") != "OK":
+            result["error"] = payload.get("ErrorMessage") or payload.get("FullError") or "Majestic API error."
+            return result
+
+        table = (payload.get("DataTables") or {}).get("Results") or {}
+        rows = table.get("Data") or []
+
+        if not rows:
+            result["error"] = "Majestic tidak mengembalikan metrics untuk domain ini."
+            return result
+
+        row = rows[0] or {}
+        tf = row.get("TrustFlow")
+        cf = row.get("CitationFlow")
+
+        result["trust_flow"] = tf
+        result["citation_flow"] = cf
+        result["referring_domains"] = row.get("RefDomains")
+        result["backlinks"] = row.get("ExtBackLinks")
+        result["status"] = row.get("Status")
+
+        try:
+            if cf is not None and float(cf) != 0 and tf is not None:
+                result["tf_cf_ratio"] = round(float(tf) / float(cf), 3)
+        except (TypeError, ValueError, ZeroDivisionError):
+            result["tf_cf_ratio"] = None
+
+    except requests.RequestException as exc:
+        result["error"] = f"Majestic request error: {exc}"
+    except Exception as exc:
+        result["error"] = f"Majestic error: {exc}"
+
+    return result
+
+
+def check_ahrefs_authority(domain: str):
+    """
+    Ahrefs API v3 Batch Analysis:
+    - Domain Rating (DR)
+    - URL Rating (UR)
+    - Referring Domains
+    - Backlinks
+
+    Streamlit Secrets:
+    AHREFS_API_KEY
+    """
+    result = {
+        "domain_rating": None,
+        "url_rating": None,
+        "referring_domains": None,
+        "backlinks": None,
+        "error": None,
+    }
+
+    api_key = _get_streamlit_secret("AHREFS_API_KEY")
+
+    if not api_key:
+        result["error"] = "AHREFS_API_KEY belum dikonfigurasi di Streamlit Secrets."
+        return result
+
+    try:
+        validate_public_target(domain)
+
+        response = requests.post(
+            "https://api.ahrefs.com/v3/batch-analysis/batch-analysis",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={
+                "select": [
+                    "domain_rating",
+                    "url_rating",
+                    "refdomains",
+                    "backlinks",
+                ],
+                "targets": [
+                    {
+                        "url": f"https://{domain}",
+                        "mode": "domain",
+                        "protocol": "both",
+                    }
+                ],
+                "output": "json",
+            },
+            timeout=TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            result["error"] = f"Ahrefs API HTTP {response.status_code}"
+            return result
+
+        payload = response.json()
+        rows = payload.get("targets") or []
+
+        if not rows:
+            result["error"] = "Ahrefs tidak mengembalikan metrics untuk domain ini."
+            return result
+
+        row = rows[0] or {}
+        result["domain_rating"] = row.get("domain_rating")
+        result["url_rating"] = row.get("url_rating")
+        result["referring_domains"] = row.get("refdomains")
+        result["backlinks"] = row.get("backlinks")
+
+    except requests.RequestException as exc:
+        result["error"] = f"Ahrefs request error: {exc}"
+    except Exception as exc:
+        result["error"] = f"Ahrefs error: {exc}"
+
+    return result
+
+
+def check_authority_metrics(domain: str):
+    validate_public_target(domain)
+
+    return {
+        "domain": domain,
+        "moz": check_moz_authority(domain),
+        "majestic": check_majestic_authority(domain),
+        "ahrefs": check_ahrefs_authority(domain),
+    }
+
+
+st.divider()
+st.subheader("Authority & Backlink Metrics")
+st.caption(
+    "Cek Moz DA/PA/Spam Score, Majestic TF/CF/TF-CF Ratio, "
+    "serta Ahrefs DR/UR/Referring Domains/Backlinks dari API provider."
+)
+
+authority_domain_input = st.text_input(
+    "Domain untuk Authority Metrics",
+    value=(domain_input or "").strip(),
+    placeholder="example.com",
+    key="authority_domain_input",
+)
+
+if st.button("Check Authority Metrics", width="content"):
+    try:
+        authority_domain = normalize_domain(authority_domain_input)
+        validate_public_target(authority_domain)
+
+        with st.spinner("Mengambil authority & backlink metrics..."):
+            st.session_state["authority_metrics_result"] = check_authority_metrics(authority_domain)
+
+    except ValueError as exc:
+        st.error(f"Target ditolak: {exc}")
+    except Exception as exc:
+        st.error(f"Authority metrics gagal: {exc}")
+
+
+authority_result = st.session_state.get("authority_metrics_result")
+
+if authority_result:
+    st.caption(f"Authority metrics untuk: {authority_result.get('domain', '-')}")
+
+    moz_data = authority_result.get("moz", {})
+    majestic_data = authority_result.get("majestic", {})
+    ahrefs_data = authority_result.get("ahrefs", {})
+
+    moz_tab, majestic_tab, ahrefs_tab = st.tabs(["Moz", "Majestic", "Ahrefs"])
+
+    with moz_tab:
+        cols = st.columns(3)
+        cols[0].metric("Moz DA", _authority_metric_value(moz_data.get("domain_authority")))
+        cols[1].metric("Moz PA", _authority_metric_value(moz_data.get("page_authority")))
+        cols[2].metric("Moz Spam Score", _authority_metric_value(moz_data.get("spam_score")))
+
+        if moz_data.get("error"):
+            st.warning(moz_data["error"])
+
+    with majestic_tab:
+        cols = st.columns(5)
+        cols[0].metric("Majestic TF", _authority_metric_value(majestic_data.get("trust_flow")))
+        cols[1].metric("Majestic CF", _authority_metric_value(majestic_data.get("citation_flow")))
+        cols[2].metric("TF/CF Ratio", _authority_metric_value(majestic_data.get("tf_cf_ratio")))
+        cols[3].metric("Referring Domains", _authority_metric_value(majestic_data.get("referring_domains")))
+        cols[4].metric("Backlinks", _authority_metric_value(majestic_data.get("backlinks")))
+
+        if majestic_data.get("status"):
+            st.caption(f"Majestic status: {majestic_data['status']}")
+
+        if majestic_data.get("error"):
+            st.warning(majestic_data["error"])
+
+    with ahrefs_tab:
+        cols = st.columns(4)
+        cols[0].metric("Ahrefs DR", _authority_metric_value(ahrefs_data.get("domain_rating")))
+        cols[1].metric("Ahrefs UR", _authority_metric_value(ahrefs_data.get("url_rating")))
+        cols[2].metric("Referring Domains", _authority_metric_value(ahrefs_data.get("referring_domains")))
+        cols[3].metric("Backlinks", _authority_metric_value(ahrefs_data.get("backlinks")))
+
+        if ahrefs_data.get("error"):
+            st.warning(ahrefs_data["error"])
+
+    st.caption(
+        "Moz, Majestic, dan Ahrefs adalah metrics milik provider masing-masing. "
+        "Nilainya hanya tersedia jika API key provider terkait aktif dan memiliki akses ke endpoint yang digunakan."
+    )
