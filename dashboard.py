@@ -48,7 +48,7 @@ session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
 st.set_page_config(
-    page_title=APP_NAME,
+    page_title="Domain Checker Online | DNS, SSL, HTTP & SEO Checker",
     page_icon="◈",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -2242,11 +2242,12 @@ def bulk_light_scan(raw_domain: str):
 st.markdown(
     """
 <div class="dc-hero">
-    <div class="dc-eyebrow">DOMAIN INTELLIGENCE & WEBSITE HEALTH PLATFORM</div>
-    <div class="dc-title">DOMAIN CHECKER PRO V6</div>
+    <div class="dc-eyebrow">ONLINE DOMAIN INTELLIGENCE & WEBSITE HEALTH PLATFORM</div>
+    <div class="dc-title">DOMAIN CHECKER</div>
     <div class="dc-subtitle">
-        DNS · HTTP/HTTPS · Redirects · SSL/TLS · RDAP · SEO · Email Security ·
-        Security Headers · DNS Propagation · Diagnostics · Compare · Bulk Analysis
+        Cek domain online untuk DNS, IP, HTTP/HTTPS, redirect, SSL/TLS, RDAP, SEO,
+        DNSSEC, email security, security headers, infrastructure, DNS propagation,
+        diagnostics, compare, dan bulk analysis.
     </div>
 </div>
 """,
@@ -2256,6 +2257,22 @@ st.markdown(
 st.caption(
     "Public-target protection aktif: localhost, private IP, link-local, reserved IP, "
     "custom ports, dan redirect ke jaringan internal akan ditolak."
+)
+
+st.markdown(
+    """
+### Domain Checker Online
+
+**Domain Checker** adalah alat untuk mengecek kondisi teknis sebuah domain dan website
+secara langsung. Masukkan nama domain untuk memeriksa DNS, alamat IP, HTTP dan HTTPS,
+SSL certificate, redirect, nameserver, DNSSEC, MX, SPF, DMARC, informasi registrasi
+domain, SEO dasar, robots.txt, sitemap.xml, security headers, response time,
+infrastruktur, dan DNS propagation.
+
+Tool ini membantu mendiagnosis domain yang tidak bisa dibuka, SSL bermasalah,
+redirect tidak sesuai, DNS belum propagasi, status HTTP error, atau konfigurasi teknis
+website yang perlu diperiksa lebih lanjut.
+"""
 )
 
 
@@ -2536,3 +2553,72 @@ with main_tabs[2]:
         if st.button("Clear Session History", width="content"):
             st.session_state["scan_history"] = []
             st.rerun()
+
+# =========================================================
+# SEO CONTENT / HELP
+# =========================================================
+
+st.divider()
+
+st.markdown(
+    """
+## Apa yang Bisa Dicek oleh Domain Checker?
+
+Domain Checker Online ini melakukan pemeriksaan teknis terhadap target domain publik.
+Pemeriksaan mencakup **DNS record**, **IPv4/IPv6**, **HTTP/HTTPS status**,
+**redirect chain**, **SSL/TLS certificate**, **DNSSEC**, **nameserver**,
+**MX/SPF/DMARC**, **RDAP dan masa berlaku domain**, **SEO dan indexability dasar**,
+**robots.txt**, **sitemap.xml**, **security headers**, **response time**,
+**infrastruktur/CDN**, serta **DNS propagation** melalui beberapa resolver publik.
+
+### Kapan Checker Domain Berguna?
+
+Gunakan checker domain saat website sulit dibuka, setelah mengganti DNS atau nameserver,
+ketika ingin mengecek apakah HTTP sudah mengarah ke HTTPS, saat memastikan SSL masih valid,
+ketika memeriksa domain sebelum digunakan, atau saat melakukan audit teknis website.
+Hasil pemeriksaan menampilkan diagnosis dan rekomendasi agar masalah lebih mudah ditemukan.
+
+### Pemeriksaan Utama
+
+- **DNS Checker:** A, AAAA, CNAME, NS, MX, TXT, CAA, SOA, DS dan DNSSEC.
+- **HTTP & HTTPS Checker:** status code, redirect, final URL, response size dan response time.
+- **SSL Checker:** validitas sertifikat, TLS version, issuer, SAN dan masa berlaku.
+- **Domain Checker:** registrar, umur domain, status RDAP dan tanggal kedaluwarsa.
+- **SEO Checker:** title, meta description, canonical, robots, H1, sitemap dan indexability dasar.
+- **Email Security:** MX, SPF dan DMARC.
+- **Security Header Checker:** HSTS, CSP, X-Frame-Options dan header keamanan lainnya.
+- **DNS Propagation:** membandingkan hasil resolver publik untuk melihat perbedaan record DNS.
+
+## FAQ Domain Checker
+
+### Apa itu domain checker?
+Domain checker adalah alat untuk memeriksa konfigurasi dan kesehatan teknis sebuah domain,
+mulai dari DNS dan IP sampai HTTP, HTTPS, SSL, registrar, SEO, serta keamanan dasar.
+
+### Bagaimana cara cek domain?
+Masukkan domain seperti `example.com` pada kolom **Target domain**, lalu klik
+**Analyze Domain**. Hasil pemeriksaan akan ditampilkan dalam beberapa tab agar mudah dibaca.
+
+### Apakah checker domain ini bisa mengecek SSL?
+Ya. Pemeriksaan SSL/TLS menampilkan validitas sertifikat, versi TLS, issuer,
+subject alternative names, tanggal berlaku, tanggal kedaluwarsa, dan sisa hari sertifikat.
+
+### Apakah bisa mengecek DNS domain?
+Ya. Tool memeriksa record A, AAAA, CNAME, NS, MX, TXT, CAA, SOA dan DS.
+Tersedia juga pemeriksaan DNS propagation dari beberapa resolver publik.
+
+### Apakah bisa mengecek status HTTP 200, 301, 404, atau 500?
+Ya. Checker menampilkan status HTTP/HTTPS, final URL, redirect chain,
+response time, serta error koneksi jika endpoint tidak dapat diakses.
+
+### Apakah Health Score menjamin domain aman atau ranking Google?
+Tidak. Health Score adalah ringkasan dari pemeriksaan teknis yang dilakukan aplikasi ini.
+Skor tersebut bukan jaminan keamanan menyeluruh, status index Google, atau peringkat pencarian.
+"""
+)
+
+st.caption(
+    "Domain Checker hanya melakukan pemeriksaan terhadap target publik dan mempertahankan "
+    "proteksi terhadap localhost, jaringan private/internal, link-local, reserved IP, "
+    "custom port, dan redirect menuju target non-public."
+)
