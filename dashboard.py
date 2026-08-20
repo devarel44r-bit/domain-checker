@@ -25,6 +25,12 @@ TIMEOUT = 10
 MAX_REDIRECTS = 8
 MAX_BULK_DOMAINS = 25
 
+PUBLIC_DNS_RESOLVERS = {
+    "Cloudflare": ["1.1.1.1", "1.0.0.1"],
+    "Google": ["8.8.8.8", "8.8.4.4"],
+    "Quad9": ["9.9.9.9", "149.112.112.112"],
+}
+
 # Session-based limits. These reduce accidental/spammy repeated scans.
 # They are NOT a replacement for reverse-proxy/CDN rate limiting.
 SINGLE_SCAN_LIMIT = 12
@@ -54,6 +60,8 @@ for key, default in {
     "single_scan_times": [],
     "bulk_scan_times": [],
     "bulk_results": [],
+    "last_reports_by_domain": {},
+    "previous_report": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -652,17 +660,153 @@ def check_email_security(domain: str, dns_data):
         if isinstance(x, str) and x.lower().startswith("v=dmarc1")
     ]
 
+    dmarc_policy = None
+    if dmarc_txt:
+        match = re.search(r"(?:^|;)\s*p\s*=\s*([^;\s]+)", dmarc_txt[0], re.I)
+        if match:
+            dmarc_policy = match.group(1).lower()
+
     mx = dns_data.get("MX", [])
 
     return {
         "spf_present": bool(spf),
         "spf_records": spf,
+        "spf_multiple": len(spf) > 1,
         "dmarc_present": bool(dmarc_txt),
         "dmarc_records": dmarc_txt,
+        "dmarc_policy": dmarc_policy,
         "mx_present": bool(mx),
         "mx_records": mx,
         "dkim_note": "DKIM membutuhkan selector; tidak bisa dipastikan hanya dari nama domain.",
     }
+
+
+
+def resolve_with_nameservers(domain: str, record_type: str, nameservers):
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = list(nameservers)
+    resolver.timeout = 3
+    resolver.lifetime = 5
+
+    try:
+        answers = resolver.resolve(domain, record_type)
+        values = []
+
+        for answer in answers:
+            if record_type == "MX":
+                values.append(f"{int(answer.preference)} {str(answer.exchange).rstrip('.')}")
+            else:
+                values.append(str(answer).strip('"').rstrip("."))
+
+        return sorted(values)
+
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        return []
+
+    except Exception as exc:
+        return [f"ERROR: {exc}"]
+
+
+def check_dns_propagation(domain: str):
+    validate_public_target(domain)
+
+    result = {}
+
+    for resolver_name, nameservers in PUBLIC_DNS_RESOLVERS.items():
+        result[resolver_name] = {
+            "A": resolve_with_nameservers(domain, "A", nameservers),
+            "AAAA": resolve_with_nameservers(domain, "AAAA", nameservers),
+            "NS": resolve_with_nameservers(domain, "NS", nameservers),
+        }
+
+    fingerprints = {}
+    for resolver_name, data in result.items():
+        fingerprint = json.dumps(
+            {
+                "A": [x for x in data["A"] if not str(x).startswith("ERROR:")],
+                "AAAA": [x for x in data["AAAA"] if not str(x).startswith("ERROR:")],
+                "NS": [x for x in data["NS"] if not str(x).startswith("ERROR:")],
+            },
+            sort_keys=True,
+        )
+        fingerprints[resolver_name] = fingerprint
+
+    healthy_fingerprints = [
+        value
+        for name, value in fingerprints.items()
+        if not any(
+            str(item).startswith("ERROR:")
+            for record_values in result[name].values()
+            for item in record_values
+        )
+    ]
+
+    result["_consistent"] = (
+        len(set(healthy_fingerprints)) <= 1
+        if healthy_fingerprints
+        else False
+    )
+
+    return result
+
+
+def diagnose_dns(report):
+    dns_data = report["dns"]
+    propagation = report.get("dns_propagation", {})
+    email = report["email_security"]
+
+    diagnostics = []
+
+    if not dns_data.get("A") and not dns_data.get("AAAA"):
+        diagnostics.append({
+            "severity": "HIGH",
+            "title": "Tidak ada A/AAAA record",
+            "description": "Domain tidak memiliki alamat IP yang berhasil ditemukan.",
+        })
+
+    if not dns_data.get("NS"):
+        diagnostics.append({
+            "severity": "HIGH",
+            "title": "Nameserver tidak ditemukan",
+            "description": "NS record tidak berhasil ditemukan.",
+        })
+
+    if dns_data.get("CNAME") and (dns_data.get("A") or dns_data.get("AAAA")):
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": "CNAME bersama A/AAAA terdeteksi",
+            "description": "Pada hostname yang sama, kombinasi CNAME dengan record lain dapat mengindikasikan konfigurasi DNS yang perlu diperiksa.",
+        })
+
+    if not dns_data.get("CAA"):
+        diagnostics.append({
+            "severity": "LOW",
+            "title": "CAA record tidak ditemukan",
+            "description": "CAA bersifat opsional, tetapi dapat membatasi CA yang diizinkan menerbitkan sertifikat.",
+        })
+
+    if not dns_data.get("dnssec_detected"):
+        diagnostics.append({
+            "severity": "LOW",
+            "title": "DS record DNSSEC tidak terdeteksi",
+            "description": "Tool ini hanya mendeteksi keberadaan DS record; ini bukan validasi penuh rantai DNSSEC.",
+        })
+
+    if email.get("spf_multiple"):
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": "Lebih dari satu SPF record terdeteksi",
+            "description": "SPF sebaiknya dipublikasikan sebagai satu policy TXT yang valid.",
+        })
+
+    if propagation and not propagation.get("_consistent", False):
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": "Hasil DNS resolver publik tidak konsisten",
+            "description": "Cloudflare, Google, dan Quad9 memberikan hasil yang berbeda atau salah satu resolver gagal menjawab.",
+        })
+
+    return diagnostics
 
 
 # =========================================================
@@ -681,6 +825,9 @@ def check_http(url: str):
         "response_bytes": None,
         "headers": {},
         "seo": {},
+        "content_encoding": None,
+        "x_robots_tag": None,
+        "powered_by": None,
         "error": None,
     }
 
@@ -697,6 +844,9 @@ def check_http(url: str):
         result["content_type"] = response.headers.get("Content-Type")
         result["response_bytes"] = len(response.content)
         result["headers"] = dict(response.headers)
+        result["content_encoding"] = response.headers.get("Content-Encoding")
+        result["x_robots_tag"] = response.headers.get("X-Robots-Tag")
+        result["powered_by"] = response.headers.get("X-Powered-By")
 
         content_type = (response.headers.get("Content-Type") or "").lower()
 
@@ -730,6 +880,8 @@ def check_resource(url: str):
         "status": None,
         "final_url": None,
         "content_type": None,
+        "looks_valid": None,
+        "validation_note": None,
         "error": None,
     }
 
@@ -738,6 +890,34 @@ def check_resource(url: str):
         result["status"] = response.status_code
         result["final_url"] = final_url
         result["content_type"] = response.headers.get("Content-Type")
+
+        body = response.text[:300_000] if response.content else ""
+        path = (urlparse(url).path or "").lower()
+
+        if path.endswith("/robots.txt"):
+            looks_valid = bool(
+                re.search(r"(?im)^\s*(user-agent|sitemap)\s*:", body)
+            )
+            result["looks_valid"] = looks_valid
+            result["validation_note"] = (
+                "robots.txt-like directives detected"
+                if looks_valid
+                else "HTTP response ada, tetapi directive robots.txt umum tidak terdeteksi"
+            )
+
+        elif path.endswith("/sitemap.xml"):
+            lower_body = body.lower()
+            looks_valid = (
+                "<urlset" in lower_body
+                or "<sitemapindex" in lower_body
+            )
+            result["looks_valid"] = looks_valid
+            result["validation_note"] = (
+                "sitemap XML structure detected"
+                if looks_valid
+                else "HTTP response ada, tetapi <urlset> / <sitemapindex> tidak terdeteksi"
+            )
+
     except Exception as exc:
         result["error"] = str(exc)
 
@@ -760,6 +940,9 @@ def check_ssl(domain: str):
         "valid_until": None,
         "days_remaining": None,
         "san": [],
+        "san_count": 0,
+        "wildcard_certificate": False,
+        "hostname_match": False,
         "error": None,
     }
 
@@ -807,6 +990,13 @@ def check_ssl(domain: str):
                     for key, value in cert.get("subjectAltName", [])
                     if key == "DNS"
                 ]
+                result["san_count"] = len(result["san"])
+                result["wildcard_certificate"] = any(
+                    str(name).startswith("*.")
+                    for name in result["san"]
+                )
+                # create_default_context + server_hostname already validates hostname.
+                result["hostname_match"] = True
 
     except Exception as exc:
         result["error"] = str(exc)
@@ -941,6 +1131,324 @@ def detect_cloudflare(dns_data, https_data):
         reasons.append("Cloudflare Server header")
 
     return {"detected": bool(reasons), "reasons": reasons}
+
+
+
+def analyze_redirects(report):
+    diagnostics = []
+    http_chain = report["http"].get("redirect_chain", [])
+    https_chain = report["https"].get("redirect_chain", [])
+
+    for label, chain in [("HTTP", http_chain), ("HTTPS", https_chain)]:
+        urls = [hop.get("url") for hop in chain if hop.get("url")]
+
+        if len(chain) > 4:
+            diagnostics.append({
+                "severity": "LOW",
+                "title": f"{label} redirect chain cukup panjang",
+                "description": f"Terdeteksi {max(0, len(chain) - 1)} redirect sebelum final response.",
+            })
+
+        if len(urls) != len(set(urls)):
+            diagnostics.append({
+                "severity": "HIGH",
+                "title": f"{label} redirect loop terindikasi",
+                "description": "URL yang sama muncul lebih dari sekali di redirect chain.",
+            })
+
+    http_final = (report["http"].get("final_url") or "").lower()
+    if report["http"].get("status_code") is not None and not http_final.startswith("https://"):
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": "HTTP tidak berakhir di HTTPS",
+            "description": "Pertimbangkan redirect HTTP → HTTPS untuk hostname publik.",
+        })
+
+    www_data = report.get("www_check", {})
+    www_final = (www_data.get("www", {}).get("final_url") or "").lower()
+    root_final = (www_data.get("root", {}).get("final_url") or "").lower()
+
+    if www_final and root_final:
+        if urlparse(www_final).hostname != urlparse(root_final).hostname:
+            diagnostics.append({
+                "severity": "LOW",
+                "title": "WWW dan non-WWW berakhir di hostname berbeda",
+                "description": f"WWW → {urlparse(www_final).hostname}; non-WWW → {urlparse(root_final).hostname}. Pastikan ini memang canonical behavior yang diinginkan.",
+            })
+
+    return diagnostics
+
+
+def analyze_indexability(report):
+    seo = report["https"].get("seo", {})
+    headers = report["https"].get("headers", {})
+    meta_robots = (seo.get("meta_robots") or "").lower()
+    x_robots = (
+        report["https"].get("x_robots_tag")
+        or headers.get("X-Robots-Tag")
+        or headers.get("x-robots-tag")
+        or ""
+    ).lower()
+
+    noindex_sources = []
+
+    if "noindex" in meta_robots:
+        noindex_sources.append("meta robots")
+
+    if "noindex" in x_robots:
+        noindex_sources.append("X-Robots-Tag")
+
+    canonical = seo.get("canonical")
+    canonical_host = None
+
+    if canonical:
+        try:
+            canonical_host = urlparse(urljoin(report["https"].get("final_url") or "", canonical)).hostname
+        except Exception:
+            canonical_host = None
+
+    final_host = urlparse(report["https"].get("final_url") or "").hostname
+
+    return {
+        "indexable_signal": not bool(noindex_sources),
+        "noindex_sources": noindex_sources,
+        "meta_robots": seo.get("meta_robots"),
+        "x_robots_tag": report["https"].get("x_robots_tag"),
+        "canonical": canonical,
+        "canonical_host": canonical_host,
+        "canonical_cross_domain": bool(
+            canonical_host
+            and final_host
+            and canonical_host.lower() != final_host.lower()
+        ),
+    }
+
+
+def analyze_performance(report):
+    https = report["https"]
+    response_ms = https.get("response_time_ms")
+    response_bytes = https.get("response_bytes")
+    encoding = https.get("content_encoding")
+
+    if response_ms is None:
+        latency_grade = "Unknown"
+    elif response_ms < 500:
+        latency_grade = "Fast"
+    elif response_ms < 1200:
+        latency_grade = "Good"
+    elif response_ms < 2500:
+        latency_grade = "Slow"
+    else:
+        latency_grade = "Very Slow"
+
+    if response_bytes is None:
+        size_grade = "Unknown"
+    elif response_bytes < 500_000:
+        size_grade = "Light"
+    elif response_bytes < 1_500_000:
+        size_grade = "Moderate"
+    else:
+        size_grade = "Heavy"
+
+    return {
+        "response_time_ms": response_ms,
+        "latency_grade": latency_grade,
+        "response_bytes": response_bytes,
+        "size_grade": size_grade,
+        "content_encoding": encoding,
+        "compression_detected": bool(encoding),
+    }
+
+
+def build_category_scores(report):
+    scores = {
+        "DNS": 100,
+        "HTTP": 100,
+        "TLS": 100,
+        "Security": 100,
+        "SEO": 100,
+        "Email": 100,
+        "Domain": 100,
+    }
+
+    dns = report["dns"]
+    propagation = report.get("dns_propagation", {})
+    if not dns.get("A") and not dns.get("AAAA"):
+        scores["DNS"] -= 50
+    if not dns.get("NS"):
+        scores["DNS"] -= 30
+    if not dns.get("dnssec_detected"):
+        scores["DNS"] -= 10
+    if propagation and not propagation.get("_consistent", False):
+        scores["DNS"] -= 15
+
+    http = report["https"]
+    code = http.get("status_code")
+    if code is None:
+        scores["HTTP"] -= 70
+    elif code >= 500:
+        scores["HTTP"] -= 40
+    elif code >= 400:
+        scores["HTTP"] -= 25
+    elif code >= 300:
+        scores["HTTP"] -= 5
+
+    perf = report.get("performance", {})
+    if perf.get("response_time_ms") is not None:
+        if perf["response_time_ms"] > 3000:
+            scores["HTTP"] -= 20
+        elif perf["response_time_ms"] > 1200:
+            scores["HTTP"] -= 10
+
+    ssl_data = report["ssl"]
+    if not ssl_data.get("valid"):
+        scores["TLS"] = 20
+    else:
+        days = ssl_data.get("days_remaining")
+        if days is not None and days < 7:
+            scores["TLS"] -= 35
+        elif days is not None and days < 30:
+            scores["TLS"] -= 15
+
+    missing_security = [
+        name
+        for name, data in report["security_headers"].items()
+        if not data["present"]
+    ]
+    scores["Security"] -= min(60, len(missing_security) * 10)
+
+    seo = report["https"].get("seo", {})
+    if not seo.get("title"):
+        scores["SEO"] -= 20
+    if not seo.get("meta_description"):
+        scores["SEO"] -= 15
+    if not seo.get("canonical"):
+        scores["SEO"] -= 10
+    if seo.get("h1_count", 0) == 0:
+        scores["SEO"] -= 10
+    if not report["indexability"]["indexable_signal"]:
+        scores["SEO"] -= 35
+    if report["robots_txt"].get("status") != 200:
+        scores["SEO"] -= 5
+    if report["sitemap_xml"].get("status") != 200:
+        scores["SEO"] -= 5
+
+    email = report["email_security"]
+    if email["mx_present"]:
+        if not email["spf_present"]:
+            scores["Email"] -= 30
+        if not email["dmarc_present"]:
+            scores["Email"] -= 30
+        if email.get("spf_multiple"):
+            scores["Email"] -= 15
+        if email.get("dmarc_policy") == "none":
+            scores["Email"] -= 10
+    else:
+        scores["Email"] = 100  # No mail service signal; don't punish a web-only domain.
+
+    rdap = report["rdap"]
+    if rdap.get("error"):
+        scores["Domain"] -= 10
+    days = rdap.get("days_to_expiry")
+    if days is not None and days < 7:
+        scores["Domain"] -= 50
+    elif days is not None and days < 30:
+        scores["Domain"] -= 25
+    elif days is not None and days < 90:
+        scores["Domain"] -= 10
+
+    for key in scores:
+        scores[key] = max(0, min(100, scores[key]))
+
+    return scores
+
+
+def build_diagnostics(report):
+    diagnostics = []
+
+    diagnostics.extend(diagnose_dns(report))
+    diagnostics.extend(analyze_redirects(report))
+
+    indexability = report["indexability"]
+
+    if indexability["noindex_sources"]:
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": "Noindex terdeteksi",
+            "description": "Sumber: " + ", ".join(indexability["noindex_sources"]),
+        })
+
+    if indexability["canonical_cross_domain"]:
+        diagnostics.append({
+            "severity": "LOW",
+            "title": "Canonical mengarah ke domain berbeda",
+            "description": f'Canonical host: {indexability["canonical_host"]}. Pastikan ini disengaja.',
+        })
+
+    robots = report["robots_txt"]
+    if robots.get("status") == 200 and robots.get("looks_valid") is False:
+        diagnostics.append({
+            "severity": "LOW",
+            "title": "robots.txt merespons 200 tetapi formatnya meragukan",
+            "description": robots.get("validation_note") or "Directive umum robots.txt tidak terdeteksi.",
+        })
+
+    sitemap = report["sitemap_xml"]
+    if sitemap.get("status") == 200 and sitemap.get("looks_valid") is False:
+        diagnostics.append({
+            "severity": "LOW",
+            "title": "sitemap.xml merespons 200 tetapi struktur sitemap tidak terdeteksi",
+            "description": sitemap.get("validation_note") or "Elemen <urlset> / <sitemapindex> tidak terdeteksi.",
+        })
+
+    perf = report["performance"]
+    if perf["latency_grade"] in ("Slow", "Very Slow"):
+        diagnostics.append({
+            "severity": "MEDIUM" if perf["latency_grade"] == "Very Slow" else "LOW",
+            "title": f'Latency: {perf["latency_grade"]}',
+            "description": f'HTTPS response time: {perf["response_time_ms"]} ms.',
+        })
+
+    if perf["size_grade"] == "Heavy":
+        diagnostics.append({
+            "severity": "LOW",
+            "title": "Response homepage cukup besar",
+            "description": f'Ukuran response sekitar {perf["response_bytes"]} bytes.',
+        })
+
+    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    diagnostics.sort(key=lambda item: order.get(item["severity"], 99))
+
+    return diagnostics
+
+
+def compare_reports(old_report, new_report):
+    if not old_report or not new_report:
+        return []
+
+    changes = []
+
+    fields = [
+        ("HTTPS status", old_report.get("https", {}).get("status_code"), new_report.get("https", {}).get("status_code")),
+        ("Final URL", old_report.get("https", {}).get("final_url"), new_report.get("https", {}).get("final_url")),
+        ("Primary IPv4", (old_report.get("dns", {}).get("A") or [None])[0], (new_report.get("dns", {}).get("A") or [None])[0]),
+        ("Nameservers", old_report.get("dns", {}).get("NS"), new_report.get("dns", {}).get("NS")),
+        ("TLS valid", old_report.get("ssl", {}).get("valid"), new_report.get("ssl", {}).get("valid")),
+        ("TLS expiry", old_report.get("ssl", {}).get("valid_until"), new_report.get("ssl", {}).get("valid_until")),
+        ("Title", old_report.get("https", {}).get("seo", {}).get("title"), new_report.get("https", {}).get("seo", {}).get("title")),
+        ("Canonical", old_report.get("https", {}).get("seo", {}).get("canonical"), new_report.get("https", {}).get("seo", {}).get("canonical")),
+        ("Health score", old_report.get("health", {}).get("score"), new_report.get("health", {}).get("score")),
+    ]
+
+    for label, before, after in fields:
+        if before != after:
+            changes.append({
+                "field": label,
+                "before": before,
+                "after": after,
+            })
+
+    return changes
 
 
 # =========================================================
@@ -1135,6 +1643,9 @@ def run_scan(domain: str):
         status.write("Resolving DNS records...")
         report["dns"] = check_dns(domain)
 
+        status.write("Checking DNS propagation across public resolvers...")
+        report["dns_propagation"] = check_dns_propagation(domain)
+
         status.write("Checking SPF / DMARC / MX...")
         report["email_security"] = check_email_security(domain, report["dns"])
 
@@ -1178,8 +1689,14 @@ def run_scan(domain: str):
         report["security_headers"] = security_headers(report["https"].get("headers", {}))
         report["cloudflare"] = detect_cloudflare(report["dns"], report["https"])
 
-        status.write("Calculating health score...")
+        status.write("Analyzing indexability and performance...")
+        report["indexability"] = analyze_indexability(report)
+        report["performance"] = analyze_performance(report)
+
+        status.write("Calculating health and category scores...")
         report["health"] = build_health(report)
+        report["category_scores"] = build_category_scores(report)
+        report["diagnostics"] = build_diagnostics(report)
 
         status.update(label="Analysis complete", state="complete", expanded=False)
 
@@ -1251,6 +1768,150 @@ def render_overview(report):
             )
 
 
+
+def render_category_scores(report):
+    scores = report.get("category_scores", {})
+
+    st.subheader("Category Scores")
+    st.caption("Skor ini adalah diagnostic heuristic dari data yang diperiksa, bukan sertifikasi keamanan.")
+
+    labels = list(scores.keys())
+    cols = st.columns(len(labels))
+
+    for idx, label in enumerate(labels):
+        score = scores[label]
+        css = "ok" if score >= 80 else "warn" if score >= 55 else "bad"
+        with cols[idx]:
+            st.markdown(
+                card(label, f"{score}/100", css, "Category health"),
+                unsafe_allow_html=True,
+            )
+
+
+def render_diagnostics(report):
+    diagnostics = report.get("diagnostics", [])
+
+    st.subheader("Deep Diagnostics")
+    st.caption("Pemeriksaan konfigurasi dan konsistensi berdasarkan hasil scan pasif.")
+
+    if not diagnostics:
+        st.success("Tidak ada diagnostic warning tambahan yang terdeteksi.")
+        return
+
+    for item in diagnostics:
+        if item["severity"] == "HIGH":
+            st.error(f'**HIGH — {item["title"]}**\n\n{item["description"]}')
+        elif item["severity"] == "MEDIUM":
+            st.warning(f'**MEDIUM — {item["title"]}**\n\n{item["description"]}')
+        else:
+            st.info(f'**LOW — {item["title"]}**\n\n{item["description"]}')
+
+
+def render_dns_propagation(report):
+    data = report.get("dns_propagation", {})
+
+    st.subheader("DNS Propagation")
+    st.caption("Perbandingan jawaban A, AAAA, dan NS dari resolver publik.")
+
+    if data.get("_consistent"):
+        st.success("Resolver publik yang berhasil menjawab memberikan hasil yang konsisten.")
+    else:
+        st.warning("Hasil resolver publik berbeda atau salah satu resolver mengalami error.")
+
+    rows = []
+    for resolver_name, values in data.items():
+        if resolver_name.startswith("_"):
+            continue
+
+        rows.append({
+            "Resolver": resolver_name,
+            "A": ", ".join(values.get("A", [])) or "-",
+            "AAAA": ", ".join(values.get("AAAA", [])) or "-",
+            "NS": ", ".join(values.get("NS", [])) or "-",
+        })
+
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def render_performance(report):
+    perf = report.get("performance", {})
+    https = report["https"]
+
+    st.subheader("Performance & Response")
+
+    cols = st.columns(4)
+
+    with cols[0]:
+        latency_class = (
+            "ok" if perf.get("latency_grade") in ("Fast", "Good")
+            else "warn" if perf.get("latency_grade") == "Slow"
+            else "bad" if perf.get("latency_grade") == "Very Slow"
+            else "neutral"
+        )
+        st.markdown(
+            card(
+                "Latency",
+                f'{perf.get("response_time_ms")} ms' if perf.get("response_time_ms") is not None else "-",
+                latency_class,
+                perf.get("latency_grade", "Unknown"),
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with cols[1]:
+        st.markdown(
+            card(
+                "Response Size",
+                f'{perf.get("response_bytes")} B' if perf.get("response_bytes") is not None else "-",
+                "neutral",
+                perf.get("size_grade", "Unknown"),
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with cols[2]:
+        st.markdown(
+            card(
+                "Compression",
+                "Detected" if perf.get("compression_detected") else "Not detected",
+                "ok" if perf.get("compression_detected") else "warn",
+                fmt(perf.get("content_encoding")),
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with cols[3]:
+        st.markdown(
+            card(
+                "Server",
+                fmt(https.get("server")),
+                "neutral",
+                fmt(https.get("powered_by")),
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def render_compare(report):
+    previous = st.session_state.get("previous_report")
+
+    st.subheader("Compare With Previous Scan")
+    st.caption("Perbandingan berlaku untuk scan sebelumnya dari domain yang sama selama sesi aplikasi.")
+
+    if not previous or previous.get("domain") != report.get("domain"):
+        st.info("Belum ada scan sebelumnya untuk domain ini pada sesi sekarang.")
+        return
+
+    changes = compare_reports(previous, report)
+
+    if not changes:
+        st.success("Tidak ada perubahan pada field utama yang dibandingkan.")
+        return
+
+    st.dataframe(changes, width="stretch", hide_index=True)
+
+
 def render_dns(report):
     dns_data = report["dns"]
 
@@ -1282,7 +1943,11 @@ def render_email_security(report):
     st.code(json.dumps(data["mx_records"], indent=2, ensure_ascii=False), language="json")
     st.subheader("SPF")
     st.code(json.dumps(data["spf_records"], indent=2, ensure_ascii=False), language="json")
+    if data.get("spf_multiple"):
+        st.warning("Lebih dari satu SPF record terdeteksi.")
+
     st.subheader("DMARC")
+    st.write("**Policy:**", fmt(data.get("dmarc_policy")))
     st.code(json.dumps(data["dmarc_records"], indent=2, ensure_ascii=False), language="json")
     st.info(data["dkim_note"])
 
@@ -1302,6 +1967,9 @@ def render_http(report):
             st.write("**Response time:**", f'{data.get("response_time_ms")} ms' if data.get("response_time_ms") is not None else "-")
             st.write("**Server:**", fmt(data.get("server")))
             st.write("**Content-Type:**", fmt(data.get("content_type")))
+            st.write("**Content-Encoding:**", fmt(data.get("content_encoding")))
+            st.write("**X-Powered-By:**", fmt(data.get("powered_by")))
+            st.write("**X-Robots-Tag:**", fmt(data.get("x_robots_tag")))
             st.write("**Response size:**", f'{data.get("response_bytes")} bytes' if data.get("response_bytes") is not None else "-")
             if data.get("error"):
                 st.error(data["error"])
@@ -1341,6 +2009,9 @@ def render_ssl(report):
         st.write("**Valid from:**", fmt(data.get("valid_from")))
         st.write("**Valid until:**", fmt(data.get("valid_until")))
         st.write("**Days remaining:**", fmt(data.get("days_remaining")))
+        st.write("**Hostname match:**", "Yes" if data.get("hostname_match") else "No")
+        st.write("**Wildcard certificate:**", "Yes" if data.get("wildcard_certificate") else "No")
+        st.write("**SAN count:**", data.get("san_count", 0))
         st.write("**Serial number:**", fmt(data.get("serial_number")))
         if data.get("error"):
             st.error(data["error"])
@@ -1399,8 +2070,25 @@ def render_seo(report):
     with c2:
         st.write("**Canonical:**", fmt(seo.get("canonical")))
         st.write("**Meta robots:**", fmt(seo.get("meta_robots")))
+        st.write("**X-Robots-Tag:**", fmt(report["https"].get("x_robots_tag")))
         st.write("**HTML language:**", fmt(seo.get("html_lang")))
         st.write("**H1 count:**", seo.get("h1_count", 0))
+
+    indexability = report.get("indexability", {})
+    st.subheader("Indexability Signals")
+
+    if indexability.get("indexable_signal"):
+        st.success("No explicit noindex signal detected.")
+    else:
+        st.warning(
+            "Noindex terdeteksi dari: "
+            + ", ".join(indexability.get("noindex_sources", []))
+        )
+
+    if indexability.get("canonical_cross_domain"):
+        st.warning(
+            f'Canonical mengarah ke domain lain: {indexability.get("canonical_host")}'
+        )
 
     st.divider()
 
@@ -1408,6 +2096,8 @@ def render_seo(report):
         st.subheader(label)
         st.write("**Status:**", fmt(data.get("status")))
         st.write("**Final URL:**", fmt(data.get("final_url")))
+        st.write("**Looks valid:**", fmt(data.get("looks_valid")))
+        st.write("**Validation:**", fmt(data.get("validation_note")))
         if data.get("error"):
             st.error(data["error"])
 
@@ -1430,6 +2120,39 @@ def render_security(report):
             json.dumps(report["https"].get("headers", {}), indent=2, ensure_ascii=False),
             language="json",
         )
+
+
+
+def render_infrastructure(report):
+    dns_data = report["dns"]
+    https = report["https"]
+    cf = report["cloudflare"]
+    perf = report.get("performance", {})
+
+    st.subheader("Infrastructure Intelligence")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.write("**IPv4:**")
+        st.code(json.dumps(dns_data.get("A", []), indent=2), language="json")
+        st.write("**IPv6:**")
+        st.code(json.dumps(dns_data.get("AAAA", []), indent=2), language="json")
+        st.write("**Nameservers:**")
+        st.code(json.dumps(dns_data.get("NS", []), indent=2), language="json")
+
+    with c2:
+        st.write("**Server header:**", fmt(https.get("server")))
+        st.write("**X-Powered-By:**", fmt(https.get("powered_by")))
+        st.write("**Content-Encoding:**", fmt(https.get("content_encoding")))
+        st.write("**Compression detected:**", "Yes" if perf.get("compression_detected") else "No")
+
+        if cf["detected"]:
+            st.success("Cloudflare detected.")
+            for reason in cf["reasons"]:
+                st.write("•", reason)
+        else:
+            st.info("Cloudflare tidak terdeteksi dari indikator DNS/HTTP yang diperiksa.")
 
 
 def render_recommendations(report):
@@ -1520,10 +2243,10 @@ st.markdown(
     """
 <div class="dc-hero">
     <div class="dc-eyebrow">DOMAIN INTELLIGENCE & WEBSITE HEALTH PLATFORM</div>
-    <div class="dc-title">DOMAIN CHECKER PRO</div>
+    <div class="dc-title">DOMAIN CHECKER PRO V6</div>
     <div class="dc-subtitle">
         DNS · HTTP/HTTPS · Redirects · SSL/TLS · RDAP · SEO · Email Security ·
-        Security Headers · Infrastructure · Bulk Analysis
+        Security Headers · DNS Propagation · Diagnostics · Compare · Bulk Analysis
     </div>
 </div>
 """,
@@ -1569,8 +2292,12 @@ if scan_clicked:
             normalized = normalize_domain(domain_input)
             validate_public_target(normalized)
 
+            previous = st.session_state["last_reports_by_domain"].get(normalized)
             report = run_scan(normalized)
+
+            st.session_state["previous_report"] = previous
             st.session_state["domain_report"] = report
+            st.session_state["last_reports_by_domain"][normalized] = report
             add_history(report)
 
         except ValueError as exc:
@@ -1596,14 +2323,20 @@ with main_tabs[0]:
         detail_tabs = st.tabs(
             [
                 "Overview",
+                "Diagnostics",
+                "Category Scores",
                 "Recommendations",
                 "DNS",
+                "DNS Propagation",
                 "Email Security",
                 "HTTP & Redirects",
+                "Performance",
                 "SSL / TLS",
                 "Domain / RDAP",
-                "SEO",
+                "SEO & Indexability",
                 "Security",
+                "Infrastructure",
+                "Compare",
                 "Export",
             ]
         )
@@ -1612,30 +2345,48 @@ with main_tabs[0]:
             render_overview(report)
 
         with detail_tabs[1]:
-            render_recommendations(report)
+            render_diagnostics(report)
 
         with detail_tabs[2]:
-            render_dns(report)
+            render_category_scores(report)
 
         with detail_tabs[3]:
-            render_email_security(report)
+            render_recommendations(report)
 
         with detail_tabs[4]:
-            render_http(report)
+            render_dns(report)
 
         with detail_tabs[5]:
-            render_ssl(report)
+            render_dns_propagation(report)
 
         with detail_tabs[6]:
-            render_rdap(report)
+            render_email_security(report)
 
         with detail_tabs[7]:
-            render_seo(report)
+            render_http(report)
 
         with detail_tabs[8]:
-            render_security(report)
+            render_performance(report)
 
         with detail_tabs[9]:
+            render_ssl(report)
+
+        with detail_tabs[10]:
+            render_rdap(report)
+
+        with detail_tabs[11]:
+            render_seo(report)
+
+        with detail_tabs[12]:
+            render_security(report)
+
+        with detail_tabs[13]:
+            render_infrastructure(report)
+
+        with detail_tabs[14]:
+            render_compare(report)
+
+        with detail_tabs[15]:
             safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", report["domain"])
             json_data = json.dumps(report, indent=2, ensure_ascii=False)
 
@@ -1648,7 +2399,7 @@ with main_tabs[0]:
             )
 
             lines = [
-                "DOMAIN CHECKER PRO REPORT",
+                "DOMAIN CHECKER PRO V6 REPORT",
                 f"Domain: {report['domain']}",
                 f"Checked: {report['checked_at']}",
                 f"Health Score: {report['health']['score']}/100",
@@ -1657,11 +2408,25 @@ with main_tabs[0]:
                 f"Final URL: {report['https'].get('final_url')}",
                 f"Response Time: {report['https'].get('response_time_ms')} ms",
                 f"SSL Valid: {report['ssl'].get('valid')}",
+                f"DNS Propagation Consistent: {report.get('dns_propagation', {}).get('_consistent')}",
+                f"Indexable Signal: {report.get('indexability', {}).get('indexable_signal')}",
                 "",
-                "ISSUES:",
+                "CATEGORY SCORES:",
             ]
 
+            for category, score in report.get("category_scores", {}).items():
+                lines.append(f"{category}: {score}/100")
+
+            lines.extend(["", "HEALTH ISSUES:"])
+
             for issue in report["health"]["issues"]:
+                lines.append(
+                    f"[{issue['severity']}] {issue['title']} - {issue['description']}"
+                )
+
+            lines.extend(["", "DEEP DIAGNOSTICS:"])
+
+            for issue in report.get("diagnostics", []):
                 lines.append(
                     f"[{issue['severity']}] {issue['title']} - {issue['description']}"
                 )
