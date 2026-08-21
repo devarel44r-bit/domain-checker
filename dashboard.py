@@ -2634,6 +2634,38 @@ def _get_streamlit_secret(name):
         return None
 
 
+def _secret_is_configured(value):
+    """Return False for empty values and common placeholder/example values."""
+    if not value:
+        return False
+
+    text = str(value).strip()
+    upper = text.upper()
+
+    exact_placeholders = {
+        "MOZ_ACCESS_ID_LU",
+        "MOZ_SECRET_KEY_LU",
+        "MAJESTIC_API_KEY_LU",
+        "AHREFS_API_KEY_LU",
+        "ACCESS_ID_MOZ_ASLI",
+        "SECRET_KEY_MOZ_ASLI",
+        "API_KEY_MAJESTIC_ASLI",
+        "API_KEY_AHREFS_ASLI",
+        "ISI_ACCESS_ID_MOZ_ASLI",
+        "ISI_SECRET_KEY_MOZ_ASLI",
+        "ISI_API_KEY_MAJESTIC_ASLI",
+        "ISI_API_KEY_AHREFS_ASLI",
+    }
+
+    if upper in exact_placeholders:
+        return False
+
+    if upper.startswith(("ISI_", "PASTE_", "YOUR_", "CONTOH_", "EXAMPLE_")):
+        return False
+
+    return True
+
+
 def _authority_metric_value(value):
     if value is None or value == "":
         return "-"
@@ -2643,29 +2675,22 @@ def _authority_metric_value(value):
 
 
 def check_moz_authority(domain: str):
-    """
-    Moz Links API v2:
-    - Domain Authority (DA)
-    - Page Authority (PA)
-    - Spam Score
-
-    Streamlit Secrets:
-    MOZ_ACCESS_ID
-    MOZ_SECRET_KEY
-    """
+    """Optional Moz metrics. Only called when real Moz credentials are configured."""
     result = {
         "domain_authority": None,
         "page_authority": None,
         "spam_score": None,
+        "configured": False,
         "error": None,
     }
 
     access_id = _get_streamlit_secret("MOZ_ACCESS_ID")
     secret_key = _get_streamlit_secret("MOZ_SECRET_KEY")
 
-    if not access_id or not secret_key:
-        result["error"] = "MOZ_ACCESS_ID / MOZ_SECRET_KEY belum dikonfigurasi di Streamlit Secrets."
+    if not (_secret_is_configured(access_id) and _secret_is_configured(secret_key)):
         return result
+
+    result["configured"] = True
 
     try:
         validate_public_target(domain)
@@ -2679,14 +2704,14 @@ def check_moz_authority(domain: str):
         )
 
         if response.status_code != 200:
-            result["error"] = f"Moz API HTTP {response.status_code}"
+            result["error"] = "Moz API belum dapat digunakan dengan credential/plan saat ini."
             return result
 
         payload = response.json()
         rows = payload.get("results") or []
 
         if not rows:
-            result["error"] = "Moz API tidak mengembalikan metrics untuk domain ini."
+            result["error"] = "Moz tidak mengembalikan metrics untuk domain ini."
             return result
 
         row = rows[0] or {}
@@ -2694,26 +2719,16 @@ def check_moz_authority(domain: str):
         result["page_authority"] = row.get("page_authority")
         result["spam_score"] = row.get("spam_score")
 
-    except requests.RequestException as exc:
-        result["error"] = f"Moz request error: {exc}"
-    except Exception as exc:
-        result["error"] = f"Moz error: {exc}"
+    except requests.RequestException:
+        result["error"] = "Moz API sedang tidak dapat dihubungi."
+    except Exception:
+        result["error"] = "Moz metrics belum dapat dimuat."
 
     return result
 
 
 def check_majestic_authority(domain: str):
-    """
-    Majestic GetIndexItemInfo:
-    - Trust Flow (TF)
-    - Citation Flow (CF)
-    - TF/CF Ratio
-    - Referring Domains
-    - External Backlinks
-
-    Streamlit Secrets:
-    MAJESTIC_API_KEY
-    """
+    """Optional Majestic metrics. Only called when a real Majestic API key is configured."""
     result = {
         "trust_flow": None,
         "citation_flow": None,
@@ -2721,14 +2736,16 @@ def check_majestic_authority(domain: str):
         "referring_domains": None,
         "backlinks": None,
         "status": None,
+        "configured": False,
         "error": None,
     }
 
     api_key = _get_streamlit_secret("MAJESTIC_API_KEY")
 
-    if not api_key:
-        result["error"] = "MAJESTIC_API_KEY belum dikonfigurasi di Streamlit Secrets."
+    if not _secret_is_configured(api_key):
         return result
+
+    result["configured"] = True
 
     try:
         validate_public_target(domain)
@@ -2747,13 +2764,13 @@ def check_majestic_authority(domain: str):
         )
 
         if response.status_code != 200:
-            result["error"] = f"Majestic API HTTP {response.status_code}"
+            result["error"] = "Majestic API belum dapat digunakan dengan key/plan saat ini."
             return result
 
         payload = response.json()
 
         if payload.get("Code") != "OK":
-            result["error"] = payload.get("ErrorMessage") or payload.get("FullError") or "Majestic API error."
+            result["error"] = "Majestic API belum dapat digunakan dengan key/plan saat ini."
             return result
 
         table = (payload.get("DataTables") or {}).get("Results") or {}
@@ -2779,38 +2796,35 @@ def check_majestic_authority(domain: str):
         except (TypeError, ValueError, ZeroDivisionError):
             result["tf_cf_ratio"] = None
 
-    except requests.RequestException as exc:
-        result["error"] = f"Majestic request error: {exc}"
-    except Exception as exc:
-        result["error"] = f"Majestic error: {exc}"
+    except requests.RequestException:
+        result["error"] = "Majestic API sedang tidak dapat dihubungi."
+    except Exception:
+        result["error"] = "Majestic metrics belum dapat dimuat."
 
     return result
 
 
 def check_ahrefs_authority(domain: str):
     """
-    Ahrefs Public API v3:
-    - Domain Rating (DR) via the free/public endpoint.
-
-    Public API keys do NOT provide UR, Referring Domains, or Backlinks.
-    Those metrics require an Ahrefs API plan/endpoints with the proper access.
-
-    Streamlit Secrets:
-    AHREFS_API_KEY
+    Ahrefs Public API v3.
+    Public API key provides Domain Rating (DR). UR, Referring Domains and
+    Backlinks require API access to additional Ahrefs endpoints/plans.
     """
     result = {
         "domain_rating": None,
         "url_rating": None,
         "referring_domains": None,
         "backlinks": None,
+        "configured": False,
         "error": None,
     }
 
     api_key = _get_streamlit_secret("AHREFS_API_KEY")
 
-    if not api_key:
-        result["error"] = "AHREFS_API_KEY belum dikonfigurasi di Streamlit Secrets."
+    if not _secret_is_configured(api_key):
         return result
+
+    result["configured"] = True
 
     try:
         validate_public_target(domain)
@@ -2821,24 +2835,12 @@ def check_ahrefs_authority(domain: str):
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
             },
-            params={
-                "target": domain,
-                "output": "json",
-            },
+            params={"target": domain, "output": "json"},
             timeout=TIMEOUT,
         )
 
         if response.status_code != 200:
-            detail = ""
-            try:
-                payload = response.json()
-                detail = payload.get("error") or payload.get("message") or ""
-            except Exception:
-                detail = response.text[:200].strip()
-
-            result["error"] = f"Ahrefs Public DR API HTTP {response.status_code}"
-            if detail:
-                result["error"] += f": {detail}"
+            result["error"] = "Ahrefs Public API key belum dapat digunakan. Periksa key di Streamlit Secrets."
             return result
 
         payload = response.json()
@@ -2850,12 +2852,12 @@ def check_ahrefs_authority(domain: str):
             result["domain_rating"] = dr_block
 
         if result["domain_rating"] is None:
-            result["error"] = "Ahrefs tidak mengembalikan nilai Domain Rating untuk target ini."
+            result["error"] = "Ahrefs tidak mengembalikan Domain Rating untuk target ini."
 
-    except requests.RequestException as exc:
-        result["error"] = f"Ahrefs request error: {exc}"
-    except Exception as exc:
-        result["error"] = f"Ahrefs error: {exc}"
+    except requests.RequestException:
+        result["error"] = "Ahrefs Public API sedang tidak dapat dihubungi."
+    except Exception:
+        result["error"] = "Ahrefs DR belum dapat dimuat."
 
     return result
 
@@ -2874,8 +2876,8 @@ def check_authority_metrics(domain: str):
 st.divider()
 st.subheader("Authority & Backlink Metrics")
 st.caption(
-    "Cek Moz DA/PA/Spam Score, Majestic TF/CF/TF-CF Ratio, "
-    "serta Ahrefs DR/UR/Referring Domains/Backlinks dari API provider."
+    "Authority metrics tambahan. Ahrefs DR dapat memakai Public API key. "
+    "Moz dan Majestic hanya aktif jika API provider terkait sudah tersedia."
 )
 
 authority_domain_input = st.text_input(
@@ -2890,7 +2892,7 @@ if st.button("Check Authority Metrics", width="content"):
         authority_domain = normalize_domain(authority_domain_input)
         validate_public_target(authority_domain)
 
-        with st.spinner("Mengambil authority & backlink metrics..."):
+        with st.spinner("Mengambil authority metrics..."):
             st.session_state["authority_metrics_result"] = check_authority_metrics(authority_domain)
 
     except ValueError as exc:
@@ -2916,8 +2918,10 @@ if authority_result:
         cols[1].metric("Moz PA", _authority_metric_value(moz_data.get("page_authority")))
         cols[2].metric("Moz Spam Score", _authority_metric_value(moz_data.get("spam_score")))
 
-        if moz_data.get("error"):
-            st.warning(moz_data["error"])
+        if not moz_data.get("configured"):
+            st.info("Moz belum aktif. DA, PA, dan Spam Score membutuhkan Moz API credentials yang valid.")
+        elif moz_data.get("error"):
+            st.info(moz_data["error"])
 
     with majestic_tab:
         cols = st.columns(5)
@@ -2927,23 +2931,31 @@ if authority_result:
         cols[3].metric("Referring Domains", _authority_metric_value(majestic_data.get("referring_domains")))
         cols[4].metric("Backlinks", _authority_metric_value(majestic_data.get("backlinks")))
 
-        if majestic_data.get("status"):
-            st.caption(f"Majestic status: {majestic_data['status']}")
-
-        if majestic_data.get("error"):
-            st.warning(majestic_data["error"])
+        if not majestic_data.get("configured"):
+            st.info("Majestic belum aktif. TF, CF, Referring Domains, dan Backlinks membutuhkan Majestic API plan/key.")
+        elif majestic_data.get("error"):
+            st.info(majestic_data["error"])
 
     with ahrefs_tab:
         cols = st.columns(4)
         cols[0].metric("Ahrefs DR", _authority_metric_value(ahrefs_data.get("domain_rating")))
-        cols[1].metric("Ahrefs UR", _authority_metric_value(ahrefs_data.get("url_rating")))
-        cols[2].metric("Referring Domains", _authority_metric_value(ahrefs_data.get("referring_domains")))
-        cols[3].metric("Backlinks", _authority_metric_value(ahrefs_data.get("backlinks")))
+        cols[1].metric("Ahrefs UR", "-")
+        cols[2].metric("Referring Domains", "-")
+        cols[3].metric("Backlinks", "-")
 
-        if ahrefs_data.get("error"):
-            st.warning(ahrefs_data["error"])
+        if not ahrefs_data.get("configured"):
+            st.info("Ahrefs DR belum aktif. Tambahkan AHREFS_API_KEY Public API di Streamlit Secrets.")
+        elif ahrefs_data.get("error"):
+            st.info(ahrefs_data["error"])
+        else:
+            st.success("Ahrefs Public API terhubung. Domain Rating (DR) aktif.")
+
+        st.caption(
+            "Ahrefs UR, Referring Domains, dan Backlinks tidak tersedia melalui Public DR endpoint; "
+            "metric tersebut membutuhkan akses API Ahrefs yang sesuai."
+        )
 
     st.caption(
-        "Moz, Majestic, dan Ahrefs adalah metrics milik provider masing-masing. "
-        "Nilainya hanya tersedia jika API key provider terkait aktif dan memiliki akses ke endpoint yang digunakan."
+        "Moz, Majestic, dan Ahrefs adalah metric milik provider masing-masing. "
+        "Tidak ada nilai authority yang dibuat atau diperkirakan oleh aplikasi ini."
     )
