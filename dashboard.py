@@ -2789,11 +2789,11 @@ def check_majestic_authority(domain: str):
 
 def check_ahrefs_authority(domain: str):
     """
-    Ahrefs API v3 Batch Analysis:
-    - Domain Rating (DR)
-    - URL Rating (UR)
-    - Referring Domains
-    - Backlinks
+    Ahrefs Public API v3:
+    - Domain Rating (DR) via the free/public endpoint.
+
+    Public API keys do NOT provide UR, Referring Domains, or Backlinks.
+    Those metrics require an Ahrefs API plan/endpoints with the proper access.
 
     Streamlit Secrets:
     AHREFS_API_KEY
@@ -2815,48 +2815,42 @@ def check_ahrefs_authority(domain: str):
     try:
         validate_public_target(domain)
 
-        response = requests.post(
-            "https://api.ahrefs.com/v3/batch-analysis/batch-analysis",
+        response = requests.get(
+            "https://api.ahrefs.com/v3/public/domain-rating-free",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
-                "Content-Type": "application/json",
             },
-            json={
-                "select": [
-                    "domain_rating",
-                    "url_rating",
-                    "refdomains",
-                    "backlinks",
-                ],
-                "targets": [
-                    {
-                        "url": f"https://{domain}",
-                        "mode": "domain",
-                        "protocol": "both",
-                    }
-                ],
+            params={
+                "target": domain,
                 "output": "json",
             },
             timeout=TIMEOUT,
         )
 
         if response.status_code != 200:
-            result["error"] = f"Ahrefs API HTTP {response.status_code}"
+            detail = ""
+            try:
+                payload = response.json()
+                detail = payload.get("error") or payload.get("message") or ""
+            except Exception:
+                detail = response.text[:200].strip()
+
+            result["error"] = f"Ahrefs Public DR API HTTP {response.status_code}"
+            if detail:
+                result["error"] += f": {detail}"
             return result
 
         payload = response.json()
-        rows = payload.get("targets") or []
+        dr_block = payload.get("domain_rating") or {}
 
-        if not rows:
-            result["error"] = "Ahrefs tidak mengembalikan metrics untuk domain ini."
-            return result
+        if isinstance(dr_block, dict):
+            result["domain_rating"] = dr_block.get("domain_rating")
+        else:
+            result["domain_rating"] = dr_block
 
-        row = rows[0] or {}
-        result["domain_rating"] = row.get("domain_rating")
-        result["url_rating"] = row.get("url_rating")
-        result["referring_domains"] = row.get("refdomains")
-        result["backlinks"] = row.get("backlinks")
+        if result["domain_rating"] is None:
+            result["error"] = "Ahrefs tidak mengembalikan nilai Domain Rating untuk target ini."
 
     except requests.RequestException as exc:
         result["error"] = f"Ahrefs request error: {exc}"
