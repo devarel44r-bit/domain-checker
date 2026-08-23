@@ -2258,10 +2258,15 @@ st.caption(
     "custom ports, dan redirect ke jaringan internal akan ditolak."
 )
 
+st.header("Domain Checker Online", anchor=False)
+
+st.text(
+    "Cek domain online untuk DNS, IP, HTTP/HTTPS, SSL/TLS, redirect, nameserver, "
+    "DNSSEC, SEO, dan status website."
+)
+
 st.markdown(
     """
-### Domain Checker Online
-
 **Domain Checker** adalah alat untuk mengecek kondisi teknis sebuah domain dan website
 secara langsung. Masukkan nama domain untuk memeriksa DNS, alamat IP, HTTP dan HTTPS,
 SSL certificate, redirect, nameserver, DNSSEC, MX, SPF, DMARC, informasi registrasi
