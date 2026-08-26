@@ -61,6 +61,7 @@ for key, default in {
     "bulk_results": [],
     "last_reports_by_domain": {},
     "previous_report": None,
+    "nawala_cache": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -545,6 +546,20 @@ class SEOParser(HTMLParser):
         self.lang = None
         self.h1_count = 0
 
+        # Additional passive SEO signals. Existing fields above are preserved.
+        self.h2_count = 0
+        self.h3_count = 0
+        self.viewport = None
+        self.og_title = None
+        self.og_description = None
+        self.og_image = None
+        self.twitter_card = None
+        self.json_ld_count = 0
+        self.hreflang = []
+        self.favicon = None
+        self.image_count = 0
+        self.images_missing_alt = 0
+
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
         attrs_dict = {str(k).lower(): v for k, v in attrs if k}
@@ -555,19 +570,52 @@ class SEOParser(HTMLParser):
             self.in_title = True
         elif tag == "h1":
             self.h1_count += 1
+        elif tag == "h2":
+            self.h2_count += 1
+        elif tag == "h3":
+            self.h3_count += 1
+        elif tag == "img":
+            self.image_count += 1
+            alt = attrs_dict.get("alt")
+            if alt is None or not str(alt).strip():
+                self.images_missing_alt += 1
+        elif tag == "script":
+            script_type = (attrs_dict.get("type") or "").lower().strip()
+            if script_type == "application/ld+json":
+                self.json_ld_count += 1
         elif tag == "meta":
             name = (attrs_dict.get("name") or "").lower()
+            prop = (attrs_dict.get("property") or "").lower()
             content = attrs_dict.get("content")
+
             if name == "description" and content:
                 self.meta_description = content.strip()
             if name == "robots" and content:
                 self.meta_robots = content.strip()
+            if name == "viewport" and content:
+                self.viewport = content.strip()
+            if name == "twitter:card" and content:
+                self.twitter_card = content.strip()
+            if prop == "og:title" and content:
+                self.og_title = content.strip()
+            if prop == "og:description" and content:
+                self.og_description = content.strip()
+            if prop == "og:image" and content:
+                self.og_image = content.strip()
+
         elif tag == "link":
             rel = attrs_dict.get("rel") or ""
             href = attrs_dict.get("href")
+            hreflang = attrs_dict.get("hreflang")
             rel_values = rel.lower().split() if isinstance(rel, str) else [str(x).lower() for x in rel]
+
             if "canonical" in rel_values and href:
                 self.canonical = href.strip()
+            if "alternate" in rel_values and hreflang and href:
+                self.hreflang.append({"lang": str(hreflang).strip(), "href": str(href).strip()})
+            if any(value in rel_values for value in ("icon", "shortcut", "apple-touch-icon")) and href:
+                if not self.favicon:
+                    self.favicon = href.strip()
 
     def handle_endtag(self, tag):
         if tag.lower() == "title":
@@ -590,6 +638,20 @@ class SEOParser(HTMLParser):
             "meta_robots": self.meta_robots,
             "html_lang": self.lang,
             "h1_count": self.h1_count,
+            "h2_count": self.h2_count,
+            "h3_count": self.h3_count,
+            "viewport": self.viewport,
+            "open_graph": {
+                "title": self.og_title,
+                "description": self.og_description,
+                "image": self.og_image,
+            },
+            "twitter_card": self.twitter_card,
+            "json_ld_count": self.json_ld_count,
+            "hreflang": self.hreflang,
+            "favicon": self.favicon,
+            "image_count": self.image_count,
+            "images_missing_alt": self.images_missing_alt,
         }
 
 
@@ -719,32 +781,43 @@ def check_dns_propagation(domain: str):
         }
 
     fingerprints = {}
-    for resolver_name, data in result.items():
-        fingerprint = json.dumps(
-            {
-                "A": [x for x in data["A"] if not str(x).startswith("ERROR:")],
-                "AAAA": [x for x in data["AAAA"] if not str(x).startswith("ERROR:")],
-                "NS": [x for x in data["NS"] if not str(x).startswith("ERROR:")],
-            },
-            sort_keys=True,
-        )
-        fingerprints[resolver_name] = fingerprint
+    healthy_names = []
+    error_names = []
 
-    healthy_fingerprints = [
-        value
-        for name, value in fingerprints.items()
-        if not any(
+    for resolver_name, data in result.items():
+        has_error = any(
             str(item).startswith("ERROR:")
-            for record_values in result[name].values()
+            for record_values in data.values()
             for item in record_values
         )
-    ]
 
+        clean_data = {
+            "A": [x for x in data["A"] if not str(x).startswith("ERROR:")],
+            "AAAA": [x for x in data["AAAA"] if not str(x).startswith("ERROR:")],
+            "NS": [x for x in data["NS"] if not str(x).startswith("ERROR:")],
+        }
+        fingerprints[resolver_name] = json.dumps(clean_data, sort_keys=True)
+
+        if has_error:
+            error_names.append(resolver_name)
+        else:
+            healthy_names.append(resolver_name)
+
+    healthy_fingerprints = [fingerprints[name] for name in healthy_names]
+    record_match = bool(healthy_fingerprints) and len(set(healthy_fingerprints)) == 1
+
+    # Backward-compatible field, now stricter: all configured resolvers must answer
+    # successfully and agree before the dashboard calls propagation "consistent".
     result["_consistent"] = (
-        len(set(healthy_fingerprints)) <= 1
-        if healthy_fingerprints
-        else False
+        len(healthy_names) == len(PUBLIC_DNS_RESOLVERS)
+        and record_match
     )
+    result["_record_match"] = record_match
+    result["_healthy_resolvers"] = healthy_names
+    result["_error_resolvers"] = error_names
+    result["_healthy_count"] = len(healthy_names)
+    result["_total_count"] = len(PUBLIC_DNS_RESOLVERS)
+    result["_consensus"] = f"{len(healthy_names)}/{len(PUBLIC_DNS_RESOLVERS)}"
 
     return result
 
@@ -1131,6 +1204,122 @@ def detect_cloudflare(dns_data, https_data):
 
     return {"detected": bool(reasons), "reasons": reasons}
 
+
+def _dns_txt_query(name: str):
+    """Best-effort TXT query used for public ASN metadata. Never raises outward."""
+    try:
+        answers = dns.resolver.resolve(name, "TXT", lifetime=5)
+        values = []
+        for answer in answers:
+            if hasattr(answer, "strings"):
+                raw = b"".join(answer.strings).decode("utf-8", errors="replace")
+            else:
+                raw = str(answer).strip('"')
+            values.append(raw)
+        return values
+    except Exception:
+        return []
+
+
+def _cymru_asn_lookup(ip_text: str):
+    """Lookup public ASN/network metadata through Team Cymru DNS (no API key)."""
+    result = {
+        "asn": None,
+        "network": None,
+        "country": None,
+        "registry": None,
+        "allocated": None,
+        "organization": None,
+    }
+
+    try:
+        ip = ipaddress.ip_address(ip_text)
+        if not ip.is_global:
+            return result
+
+        if ip.version == 4:
+            origin_name = ".".join(reversed(ip_text.split("."))) + ".origin.asn.cymru.com"
+        else:
+            expanded = ip.exploded.replace(":", "")
+            origin_name = ".".join(reversed(expanded)) + ".origin6.asn.cymru.com"
+
+        origin_rows = _dns_txt_query(origin_name)
+        if not origin_rows:
+            return result
+
+        parts = [part.strip() for part in origin_rows[0].split("|")]
+        if len(parts) >= 5:
+            result["asn"] = parts[0]
+            result["network"] = parts[1]
+            result["country"] = parts[2]
+            result["registry"] = parts[3]
+            result["allocated"] = parts[4]
+
+        asn = result.get("asn")
+        if asn:
+            # Multi-origin responses can contain multiple ASNs; use the first for display.
+            first_asn = str(asn).split()[0].split(",")[0]
+            detail_rows = _dns_txt_query(f"AS{first_asn}.asn.cymru.com")
+            if detail_rows:
+                detail_parts = [part.strip() for part in detail_rows[0].split("|")]
+                if len(detail_parts) >= 5:
+                    result["organization"] = detail_parts[4]
+
+    except Exception:
+        pass
+
+    return result
+
+
+def check_ip_intelligence(domain: str, dns_data=None):
+    """Passive, best-effort IP intelligence. Failure never fails the main scan."""
+    result = {
+        "primary_ip": None,
+        "all_ips": [],
+        "reverse_dns": None,
+        "asn": None,
+        "network": None,
+        "country": None,
+        "registry": None,
+        "allocated": None,
+        "organization": None,
+        "error": None,
+    }
+
+    try:
+        dns_data = dns_data or {}
+        candidates = []
+        for key in ("A", "AAAA"):
+            for value in dns_data.get(key, []) or []:
+                if isinstance(value, str) and ip_is_public(value):
+                    candidates.append(value)
+
+        if not candidates:
+            candidates = [ip for ip in resolve_host_ips(domain) if ip_is_public(ip)]
+
+        # Keep ordering deterministic and IPv4 first when available.
+        candidates = sorted(set(candidates), key=lambda value: (ipaddress.ip_address(value).version, value))
+        result["all_ips"] = candidates
+
+        if not candidates:
+            result["error"] = "Tidak ada public IP yang dapat dianalisis."
+            return result
+
+        primary_ip = candidates[0]
+        result["primary_ip"] = primary_ip
+
+        try:
+            result["reverse_dns"] = socket.gethostbyaddr(primary_ip)[0]
+        except Exception:
+            result["reverse_dns"] = None
+
+        asn_data = _cymru_asn_lookup(primary_ip)
+        result.update(asn_data)
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
 def analyze_redirects(report):
@@ -1688,6 +1877,9 @@ def run_scan(domain: str):
         report["security_headers"] = security_headers(report["https"].get("headers", {}))
         report["cloudflare"] = detect_cloudflare(report["dns"], report["https"])
 
+        status.write("Collecting passive IP / ASN intelligence...")
+        report["ip_intelligence"] = check_ip_intelligence(domain, report["dns"])
+
         status.write("Analyzing indexability and performance...")
         report["indexability"] = analyze_indexability(report)
         report["performance"] = analyze_performance(report)
@@ -1810,20 +2002,38 @@ def render_dns_propagation(report):
     data = report.get("dns_propagation", {})
 
     st.subheader("DNS Propagation")
-    st.caption("Perbandingan jawaban A, AAAA, dan NS dari resolver publik.")
+    st.caption("Perbandingan jawaban A, AAAA, dan NS dari resolver publik. Resolver error dipisahkan dari perbedaan record.")
+
+    healthy = data.get("_healthy_count", 0)
+    total = data.get("_total_count", len(PUBLIC_DNS_RESOLVERS))
+    record_match = data.get("_record_match", False)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Resolver Health", f"{healthy}/{total}")
+    c2.metric("Record Match", "YES" if record_match else "NO")
+    c3.metric("Overall", "CONSISTENT" if data.get("_consistent") else "CHECK")
 
     if data.get("_consistent"):
-        st.success("Resolver publik yang berhasil menjawab memberikan hasil yang konsisten.")
+        st.success("Semua resolver publik berhasil menjawab dan memberikan record yang sama.")
+    elif record_match and healthy:
+        st.warning("Resolver yang berhasil menjawab memiliki record yang sama, tetapi ada resolver yang error/timeout.")
     else:
-        st.warning("Hasil resolver publik berbeda atau salah satu resolver mengalami error.")
+        st.warning("Record berbeda antar resolver atau data resolver belum cukup untuk menyatakan propagasi konsisten.")
 
     rows = []
     for resolver_name, values in data.items():
         if resolver_name.startswith("_"):
             continue
 
+        has_error = any(
+            str(item).startswith("ERROR:")
+            for record_values in values.values()
+            for item in record_values
+        )
+
         rows.append({
             "Resolver": resolver_name,
+            "Status": "ERROR" if has_error else "OK",
             "A": ", ".join(values.get("A", [])) or "-",
             "AAAA": ", ".join(values.get("AAAA", [])) or "-",
             "NS": ", ".join(values.get("NS", [])) or "-",
@@ -2065,13 +2275,37 @@ def render_seo(report):
         st.write("**Title length:**", seo.get("title_length", 0))
         st.write("**Meta description:**", fmt(seo.get("meta_description")))
         st.write("**Description length:**", seo.get("meta_description_length", 0))
+        st.write("**Viewport:**", fmt(seo.get("viewport")))
+        st.write("**Favicon:**", fmt(seo.get("favicon")))
 
     with c2:
         st.write("**Canonical:**", fmt(seo.get("canonical")))
         st.write("**Meta robots:**", fmt(seo.get("meta_robots")))
         st.write("**X-Robots-Tag:**", fmt(report["https"].get("x_robots_tag")))
         st.write("**HTML language:**", fmt(seo.get("html_lang")))
-        st.write("**H1 count:**", seo.get("h1_count", 0))
+        st.write("**H1 / H2 / H3:**", f'{seo.get("h1_count", 0)} / {seo.get("h2_count", 0)} / {seo.get("h3_count", 0)}')
+        st.write("**JSON-LD blocks:**", seo.get("json_ld_count", 0))
+
+    st.subheader("Social / Structured Signals")
+    social_cols = st.columns(3)
+    og = seo.get("open_graph") or {}
+    social_cols[0].metric("Open Graph", "Detected" if any(og.values()) else "Not detected")
+    social_cols[1].metric("Twitter Card", "Detected" if seo.get("twitter_card") else "Not detected")
+    social_cols[2].metric("Hreflang", len(seo.get("hreflang") or []))
+
+    with st.expander("Open Graph / Twitter / Hreflang details"):
+        st.write("**Open Graph:**")
+        st.code(json.dumps(og, indent=2, ensure_ascii=False), language="json")
+        st.write("**Twitter Card:**", fmt(seo.get("twitter_card")))
+        st.write("**Hreflang:**")
+        st.code(json.dumps(seo.get("hreflang") or [], indent=2, ensure_ascii=False), language="json")
+
+    st.subheader("Image Accessibility Signal")
+    image_total = seo.get("image_count", 0)
+    image_missing_alt = seo.get("images_missing_alt", 0)
+    image_cols = st.columns(2)
+    image_cols[0].metric("Images", image_total)
+    image_cols[1].metric("Missing / Empty ALT", image_missing_alt)
 
     indexability = report.get("indexability", {})
     st.subheader("Indexability Signals")
@@ -2154,6 +2388,35 @@ def render_infrastructure(report):
             st.info("Cloudflare tidak terdeteksi dari indikator DNS/HTTP yang diperiksa.")
 
 
+def render_ip_intelligence(report):
+    data = report.get("ip_intelligence", {})
+    cf = report.get("cloudflare", {})
+
+    st.subheader("IP Intelligence")
+    st.caption("Passive public-network metadata. ASN lookup is best-effort and does not affect the existing Health Score.")
+
+    if data.get("error"):
+        st.warning(data["error"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Primary IP", fmt(data.get("primary_ip")))
+    c2.metric("ASN", f'AS{data.get("asn")}' if data.get("asn") else "-")
+    c3.metric("Country", fmt(data.get("country")))
+    c4.metric("CDN / Edge", "Cloudflare" if cf.get("detected") else "Not detected")
+
+    st.write("**Network / Prefix:**", fmt(data.get("network")))
+    st.write("**Organization:**", fmt(data.get("organization")))
+    st.write("**Registry:**", fmt(data.get("registry")))
+    st.write("**Allocated:**", fmt(data.get("allocated")))
+    st.write("**Reverse DNS / PTR:**", fmt(data.get("reverse_dns")))
+
+    st.write("**All resolved public IPs:**")
+    st.code(json.dumps(data.get("all_ips") or [], indent=2, ensure_ascii=False), language="json")
+
+    if cf.get("detected"):
+        st.info("Cloudflare terdeteksi. IP/ASN yang tampil dapat merupakan edge/proxy Cloudflare, bukan origin server.")
+
+
 def render_recommendations(report):
     issues = report["health"]["issues"]
 
@@ -2190,7 +2453,7 @@ def add_history(report):
 # BULK SCAN
 # =========================================================
 
-def bulk_nawala_check(domain: str):
+def _bulk_nawala_check_uncached(domain: str):
     """
     Lightweight Nawala check khusus Bulk Scan.
     Menggunakan endpoint resmi NawalaCheck dan 1 API request per domain.
@@ -2298,6 +2561,22 @@ def bulk_nawala_check(domain: str):
         result["status"] = "ERROR"
 
     return result
+
+
+def bulk_nawala_check(domain: str):
+    """5-minute per-session cache to protect Nawala provider quota in Bulk Scan."""
+    cache = st.session_state.setdefault("nawala_cache", {})
+    cache_key = f"bulk:{domain.lower().rstrip('.')}"
+    cached = cache.get(cache_key)
+    now = time.time()
+
+    if cached and now - cached.get("ts", 0) < 300:
+        return dict(cached.get("value") or {})
+
+    value = _bulk_nawala_check_uncached(domain)
+    cache[cache_key] = {"ts": now, "value": dict(value)}
+    st.session_state["nawala_cache"] = cache
+    return value
 
 
 def bulk_light_scan(raw_domain: str, include_nawala=False):
@@ -2481,6 +2760,7 @@ with main_tabs[0]:
                 "SEO & Indexability",
                 "Security",
                 "Infrastructure",
+                "IP Intelligence",
                 "Compare",
                 "Export",
             ]
@@ -2529,9 +2809,12 @@ with main_tabs[0]:
             render_infrastructure(report)
 
         with detail_tabs[14]:
-            render_compare(report)
+            render_ip_intelligence(report)
 
         with detail_tabs[15]:
+            render_compare(report)
+
+        with detail_tabs[16]:
             safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", report["domain"])
             json_data = json.dumps(report, indent=2, ensure_ascii=False)
 
@@ -2544,7 +2827,7 @@ with main_tabs[0]:
             )
 
             lines = [
-                "DOMAIN CHECKER PRO V6 REPORT",
+                "DOMAIN CHECKER PRO V7 REPORT",
                 f"Domain: {report['domain']}",
                 f"Checked: {report['checked_at']}",
                 f"Health Score: {report['health']['score']}/100",
@@ -3174,7 +3457,7 @@ def validate_nawala_domain(domain: str):
     return host
 
 
-def check_nawala_status(domain: str):
+def _check_nawala_status_uncached(domain: str):
     """
     Cek status blokir domain Indonesia.
 
@@ -3366,6 +3649,26 @@ def check_nawala_status(domain: str):
     return result
 
 
+def check_nawala_status(domain: str):
+    """5-minute per-session cache. Does not expose or persist the API key."""
+    cache = st.session_state.setdefault("nawala_cache", {})
+    cache_key = f"full:{domain.lower().rstrip('.')}"
+    cached = cache.get(cache_key)
+    now = time.time()
+
+    if cached and now - cached.get("ts", 0) < 300:
+        value = dict(cached.get("value") or {})
+        value["cache_hit"] = True
+        return value
+
+    value = _check_nawala_status_uncached(domain)
+    stored = dict(value)
+    stored["cache_hit"] = False
+    cache[cache_key] = {"ts": now, "value": stored}
+    st.session_state["nawala_cache"] = cache
+    return stored
+
+
 st.divider()
 st.subheader("Nawala / Indonesia Block Check")
 st.caption(
@@ -3414,6 +3717,9 @@ if nawala_result:
     cols[1].metric("Blocked", "YES" if blocked is True else "NO" if blocked is False else "-")
     cols[2].metric("Provider", nawala_result.get("provider", "NawalaCheck"))
     cols[3].metric("API HTTP", nawala_result.get("http_status") or "-")
+
+    if nawala_result.get("cache_hit"):
+        st.caption("Hasil diambil dari cache sesi (maks. 5 menit) untuk menghemat kuota provider.")
 
     if not nawala_result.get("configured"):
         st.info(
