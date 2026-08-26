@@ -3020,7 +3020,7 @@ def check_nawala_status(domain: str):
         validate_public_target(domain)
 
         response = requests.get(
-            "https://nawalacheck.com/api",
+            "https://nawalacheck.com/api/",
             params={"domain": domain},
             headers={
                 "X-API-Key": api_key,
