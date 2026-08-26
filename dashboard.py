@@ -6,6 +6,7 @@ import re
 import socket
 import ssl
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -24,6 +25,8 @@ APP_NAME = "Domain Checker Pro"
 TIMEOUT = 10
 MAX_REDIRECTS = 8
 MAX_BULK_DOMAINS = 25
+BULK_MAX_WORKERS = 5
+AUTHORITY_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 PUBLIC_DNS_RESOLVERS = {
     "Cloudflare": ["1.1.1.1", "1.0.0.1"],
@@ -41,7 +44,7 @@ BULK_SCAN_WINDOW_SECONDS = 60
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151 Safari/537.36 DomainCheckerPro/5.0"
+    "Chrome/151 Safari/537.36 DomainCheckerPro/8.0"
 )
 
 session = requests.Session()
@@ -62,6 +65,7 @@ for key, default in {
     "last_reports_by_domain": {},
     "previous_report": None,
     "nawala_cache": {},
+    "authority_cache": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -488,14 +492,15 @@ def validate_url_target(url: str):
 # SAFE HTTP WITH VALIDATED REDIRECTS
 # =========================================================
 
-def safe_http_get(url: str, max_redirects=MAX_REDIRECTS):
+def safe_http_get(url: str, max_redirects=MAX_REDIRECTS, http_session=None):
     current_url = url
     history = []
+    client = http_session or session
 
     for _ in range(max_redirects + 1):
         validate_url_target(current_url)
 
-        response = session.get(
+        response = client.get(
             current_url,
             timeout=TIMEOUT,
             allow_redirects=False,
@@ -885,7 +890,7 @@ def diagnose_dns(report):
 # HTTP / HTTPS
 # =========================================================
 
-def check_http(url: str):
+def check_http(url: str, http_session=None):
     result = {
         "requested_url": url,
         "status_code": None,
@@ -905,7 +910,7 @@ def check_http(url: str):
 
     try:
         start = time.perf_counter()
-        response, history, final_url = safe_http_get(url)
+        response, history, final_url = safe_http_get(url, http_session=http_session)
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
 
         result["status_code"] = response.status_code
@@ -1076,6 +1081,111 @@ def check_ssl(domain: str):
     return result
 
 
+def _probe_tls_version(domain: str, version):
+    """Probe one TLS version without affecting the normal certificate check."""
+    result = {"status": "UNKNOWN", "cipher": None, "error": None}
+
+    try:
+        validate_public_target(domain)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.load_default_certs()
+        context.minimum_version = version
+        context.maximum_version = version
+
+        # Old TLS versions may be disabled by the local OpenSSL security policy.
+        if version in (getattr(ssl.TLSVersion, "TLSv1", None), getattr(ssl.TLSVersion, "TLSv1_1", None)):
+            try:
+                context.set_ciphers("DEFAULT:@SECLEVEL=0")
+            except ssl.SSLError:
+                pass
+
+        with socket.create_connection((domain, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                result["status"] = "SUPPORTED"
+                cipher = ssock.cipher()
+                if cipher:
+                    result["cipher"] = cipher[0]
+
+    except (ssl.SSLError, ConnectionError, OSError) as exc:
+        text = str(exc)
+        local_policy_signals = (
+            "NO_CIPHERS_AVAILABLE",
+            "UNSUPPORTED_PROTOCOL",
+            "no protocols available",
+            "version too low",
+        )
+        if any(signal.lower() in text.lower() for signal in local_policy_signals):
+            result["status"] = "CLIENT_UNAVAILABLE"
+        else:
+            result["status"] = "NOT_SUPPORTED"
+        result["error"] = text
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+def check_tls_capabilities(domain: str, ssl_data=None):
+    """Best-effort TLS protocol audit; kept separate from the existing SSL validator."""
+    ssl_data = ssl_data or {}
+    result = {
+        "protocols": {},
+        "grade": "Unknown",
+        "weak_protocol_detected": False,
+        "modern_tls": False,
+        "note": None,
+    }
+
+    if not ssl_data.get("valid"):
+        result["grade"] = "F"
+        result["note"] = "Protocol audit dilewati karena validasi/koneksi TLS dasar gagal."
+        return result
+
+    versions = []
+    for label, attr in (
+        ("TLS 1.0", "TLSv1"),
+        ("TLS 1.1", "TLSv1_1"),
+        ("TLS 1.2", "TLSv1_2"),
+        ("TLS 1.3", "TLSv1_3"),
+    ):
+        version = getattr(ssl.TLSVersion, attr, None)
+        if version is not None:
+            versions.append((label, version))
+        else:
+            result["protocols"][label] = {"status": "CLIENT_UNAVAILABLE", "cipher": None, "error": None}
+
+    for label, version in versions:
+        result["protocols"][label] = _probe_tls_version(domain, version)
+
+    tls10 = result["protocols"].get("TLS 1.0", {}).get("status")
+    tls11 = result["protocols"].get("TLS 1.1", {}).get("status")
+    tls12 = result["protocols"].get("TLS 1.2", {}).get("status")
+    tls13 = result["protocols"].get("TLS 1.3", {}).get("status")
+
+    weak = tls10 == "SUPPORTED" or tls11 == "SUPPORTED"
+    result["weak_protocol_detected"] = weak
+    result["modern_tls"] = tls12 == "SUPPORTED" or tls13 == "SUPPORTED"
+
+    if weak:
+        result["grade"] = "C"
+    elif tls13 == "SUPPORTED" and tls12 == "SUPPORTED":
+        result["grade"] = "A"
+    elif tls12 == "SUPPORTED":
+        result["grade"] = "B"
+    elif result["modern_tls"]:
+        result["grade"] = "B"
+
+    if any(v.get("status") == "CLIENT_UNAVAILABLE" for v in result["protocols"].values()):
+        result["note"] = (
+            "Sebagian protocol lama tidak dapat diuji secara pasti karena kebijakan OpenSSL pada server checker. "
+            "Status CLIENT_UNAVAILABLE bukan bukti bahwa server target mendukung protocol tersebut."
+        )
+
+    return result
+
+
 # =========================================================
 # RDAP
 # =========================================================
@@ -1186,6 +1296,82 @@ def security_headers(headers):
     return result
 
 
+def analyze_security_header_quality(headers):
+    """Evaluate basic header quality without changing the legacy presence-based score."""
+    if not headers:
+        return {"score": None, "grade": "Unknown", "findings": []}
+
+    lower = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+    findings = []
+    points = 100
+
+    hsts = lower.get("strict-transport-security")
+    if not hsts:
+        points -= 20
+        findings.append({"severity": "MEDIUM", "header": "HSTS", "message": "Header tidak ditemukan."})
+    else:
+        max_age_match = re.search(r"max-age\s*=\s*(\d+)", hsts, re.I)
+        max_age = int(max_age_match.group(1)) if max_age_match else None
+        if max_age is None:
+            points -= 12
+            findings.append({"severity": "MEDIUM", "header": "HSTS", "message": "max-age tidak ditemukan/valid."})
+        elif max_age < 31536000:
+            points -= 7
+            findings.append({"severity": "LOW", "header": "HSTS", "message": f"max-age {max_age} detik; idealnya minimal 31536000 untuk policy jangka panjang."})
+        if "includesubdomains" not in hsts.lower():
+            points -= 3
+            findings.append({"severity": "LOW", "header": "HSTS", "message": "includeSubDomains tidak terdeteksi."})
+
+    csp = lower.get("content-security-policy")
+    if not csp:
+        points -= 25
+        findings.append({"severity": "MEDIUM", "header": "CSP", "message": "Content-Security-Policy tidak ditemukan."})
+    else:
+        csp_l = csp.lower()
+        if "'unsafe-eval'" in csp_l:
+            points -= 10
+            findings.append({"severity": "MEDIUM", "header": "CSP", "message": "unsafe-eval terdeteksi."})
+        if "'unsafe-inline'" in csp_l:
+            points -= 7
+            findings.append({"severity": "LOW", "header": "CSP", "message": "unsafe-inline terdeteksi."})
+        if re.search(r"(?:^|[;\s])(?:default-src|script-src|object-src)[^;]*\*", csp_l):
+            points -= 8
+            findings.append({"severity": "MEDIUM", "header": "CSP", "message": "Wildcard source (*) terdeteksi pada directive penting."})
+        if "default-src" not in csp_l:
+            points -= 3
+            findings.append({"severity": "LOW", "header": "CSP", "message": "default-src tidak terdeteksi."})
+
+    xcto = lower.get("x-content-type-options")
+    if not xcto:
+        points -= 8
+        findings.append({"severity": "LOW", "header": "X-Content-Type-Options", "message": "Header tidak ditemukan."})
+    elif xcto.lower() != "nosniff":
+        points -= 5
+        findings.append({"severity": "LOW", "header": "X-Content-Type-Options", "message": f"Value '{xcto}' bukan nosniff."})
+
+    xfo = lower.get("x-frame-options")
+    if xfo and xfo.lower() not in ("deny", "sameorigin"):
+        points -= 4
+        findings.append({"severity": "LOW", "header": "X-Frame-Options", "message": f"Value '{xfo}' tidak umum/kurang ketat."})
+
+    referrer = lower.get("referrer-policy")
+    if not referrer:
+        points -= 5
+        findings.append({"severity": "LOW", "header": "Referrer-Policy", "message": "Header tidak ditemukan."})
+
+    permissions = lower.get("permissions-policy")
+    if not permissions:
+        points -= 4
+        findings.append({"severity": "LOW", "header": "Permissions-Policy", "message": "Header tidak ditemukan."})
+
+    points = max(0, min(100, points))
+    grade = "A" if points >= 90 else "B" if points >= 80 else "C" if points >= 70 else "D" if points >= 55 else "F"
+    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    findings.sort(key=lambda item: order.get(item.get("severity"), 9))
+
+    return {"score": points, "grade": grade, "findings": findings}
+
+
 def detect_cloudflare(dns_data, https_data):
     reasons = []
     ns_values = dns_data.get("NS", [])
@@ -1272,7 +1458,11 @@ def _cymru_asn_lookup(ip_text: str):
 
 
 def check_ip_intelligence(domain: str, dns_data=None):
-    """Passive, best-effort IP intelligence. Failure never fails the main scan."""
+    """Passive, best-effort IP intelligence. Failure never fails the main scan.
+
+    Backward-compatible primary fields are preserved, while ip_details exposes
+    per-address PTR/ASN/network metadata for multi-IP/CDN targets.
+    """
     result = {
         "primary_ip": None,
         "all_ips": [],
@@ -1283,6 +1473,7 @@ def check_ip_intelligence(domain: str, dns_data=None):
         "registry": None,
         "allocated": None,
         "organization": None,
+        "ip_details": [],
         "error": None,
     }
 
@@ -1297,7 +1488,7 @@ def check_ip_intelligence(domain: str, dns_data=None):
         if not candidates:
             candidates = [ip for ip in resolve_host_ips(domain) if ip_is_public(ip)]
 
-        # Keep ordering deterministic and IPv4 first when available.
+        # Deterministic ordering, IPv4 first. Cap deep metadata lookups to keep scan time bounded.
         candidates = sorted(set(candidates), key=lambda value: (ipaddress.ip_address(value).version, value))
         result["all_ips"] = candidates
 
@@ -1305,22 +1496,50 @@ def check_ip_intelligence(domain: str, dns_data=None):
             result["error"] = "Tidak ada public IP yang dapat dianalisis."
             return result
 
-        primary_ip = candidates[0]
-        result["primary_ip"] = primary_ip
+        details = []
+        for ip_text in candidates[:8]:
+            detail = {
+                "ip": ip_text,
+                "version": ipaddress.ip_address(ip_text).version,
+                "reverse_dns": None,
+                "asn": None,
+                "network": None,
+                "country": None,
+                "registry": None,
+                "allocated": None,
+                "organization": None,
+            }
 
-        try:
-            result["reverse_dns"] = socket.gethostbyaddr(primary_ip)[0]
-        except Exception:
-            result["reverse_dns"] = None
+            try:
+                detail["reverse_dns"] = socket.gethostbyaddr(ip_text)[0]
+            except Exception:
+                pass
 
-        asn_data = _cymru_asn_lookup(primary_ip)
-        result.update(asn_data)
+            detail.update(_cymru_asn_lookup(ip_text))
+            details.append(detail)
+
+        result["ip_details"] = details
+
+        primary = details[0] if details else {"ip": candidates[0]}
+        result["primary_ip"] = primary.get("ip")
+        result["reverse_dns"] = primary.get("reverse_dns")
+        result["asn"] = primary.get("asn")
+        result["network"] = primary.get("network")
+        result["country"] = primary.get("country")
+        result["registry"] = primary.get("registry")
+        result["allocated"] = primary.get("allocated")
+        result["organization"] = primary.get("organization")
+
+        if len(candidates) > 8:
+            result["error"] = (
+                f"{len(candidates)} public IP terdeteksi; metadata detail dibatasi ke 8 IP pertama "
+                "agar scan tetap responsif."
+            )
 
     except Exception as exc:
         result["error"] = str(exc)
 
     return result
-
 
 def analyze_redirects(report):
     diagnostics = []
@@ -1410,6 +1629,87 @@ def analyze_indexability(report):
             and canonical_host.lower() != final_host.lower()
         ),
     }
+
+
+def measure_network_timing(domain: str):
+    """Best-effort DNS/TCP/TLS/TTFB timing for the HTTPS root endpoint.
+
+    This is a separate diagnostic probe and does not replace the legacy requests-based
+    response_time_ms measurement.
+    """
+    result = {
+        "dns_ms": None,
+        "tcp_connect_ms": None,
+        "tls_handshake_ms": None,
+        "ttfb_ms": None,
+        "total_ms": None,
+        "target_ip": None,
+        "error": None,
+    }
+
+    overall_start = time.perf_counter()
+    raw_sock = None
+    tls_sock = None
+
+    try:
+        validate_public_target(domain)
+
+        dns_start = time.perf_counter()
+        addrinfo = socket.getaddrinfo(domain, 443, type=socket.SOCK_STREAM)
+        result["dns_ms"] = round((time.perf_counter() - dns_start) * 1000, 2)
+
+        public_candidates = []
+        for family, socktype, proto, _, sockaddr in addrinfo:
+            ip_text = sockaddr[0]
+            if ip_is_public(ip_text):
+                public_candidates.append((family, socktype, proto, sockaddr))
+
+        if not public_candidates:
+            raise ValueError("Tidak ada public IP untuk timing probe.")
+
+        family, socktype, proto, sockaddr = public_candidates[0]
+        result["target_ip"] = sockaddr[0]
+
+        tcp_start = time.perf_counter()
+        raw_sock = socket.socket(family, socktype, proto)
+        raw_sock.settimeout(6)
+        raw_sock.connect(sockaddr)
+        result["tcp_connect_ms"] = round((time.perf_counter() - tcp_start) * 1000, 2)
+
+        context = ssl.create_default_context()
+        tls_start = time.perf_counter()
+        tls_sock = context.wrap_socket(raw_sock, server_hostname=domain)
+        raw_sock = None  # ownership transferred to tls_sock
+        result["tls_handshake_ms"] = round((time.perf_counter() - tls_start) * 1000, 2)
+
+        request = (
+            f"HEAD / HTTP/1.1\r\nHost: {domain}\r\n"
+            f"User-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+        tls_sock.sendall(request)
+
+        ttfb_start = time.perf_counter()
+        first_byte = tls_sock.recv(1)
+        result["ttfb_ms"] = round((time.perf_counter() - ttfb_start) * 1000, 2)
+        if not first_byte:
+            result["error"] = "Server menutup koneksi sebelum byte response pertama diterima."
+
+    except Exception as exc:
+        result["error"] = str(exc)
+    finally:
+        try:
+            if tls_sock is not None:
+                tls_sock.close()
+        except Exception:
+            pass
+        try:
+            if raw_sock is not None:
+                raw_sock.close()
+        except Exception:
+            pass
+        result["total_ms"] = round((time.perf_counter() - overall_start) * 1000, 2)
+
+    return result
 
 
 def analyze_performance(report):
@@ -1604,6 +1904,30 @@ def build_diagnostics(report):
             "description": f'Ukuran response sekitar {perf["response_bytes"]} bytes.',
         })
 
+    tls_caps = report.get("tls_capabilities", {})
+    if tls_caps.get("weak_protocol_detected"):
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": "Protocol TLS lama masih didukung",
+            "description": "TLS 1.0 atau TLS 1.1 terdeteksi dapat dinegosiasikan. Pertimbangkan menonaktifkan protocol lama.",
+        })
+
+    sec_quality = report.get("security_header_quality", {})
+    if sec_quality.get("grade") in ("D", "F"):
+        diagnostics.append({
+            "severity": "MEDIUM",
+            "title": f'Security header quality: {sec_quality.get("grade")}',
+            "description": f'Skor kualitas header {sec_quality.get("score")}/100. Lihat tab Security untuk detail policy.',
+        })
+
+    timing = report.get("network_timing", {})
+    if timing.get("ttfb_ms") is not None and timing.get("ttfb_ms") > 1200:
+        diagnostics.append({
+            "severity": "LOW" if timing.get("ttfb_ms") < 2500 else "MEDIUM",
+            "title": "TTFB lambat",
+            "description": f'Probe HTTPS menerima byte pertama dalam sekitar {timing.get("ttfb_ms")} ms setelah request dikirim.',
+        })
+
     order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     diagnostics.sort(key=lambda item: order.get(item["severity"], 99))
 
@@ -1623,6 +1947,9 @@ def compare_reports(old_report, new_report):
         ("Nameservers", old_report.get("dns", {}).get("NS"), new_report.get("dns", {}).get("NS")),
         ("TLS valid", old_report.get("ssl", {}).get("valid"), new_report.get("ssl", {}).get("valid")),
         ("TLS expiry", old_report.get("ssl", {}).get("valid_until"), new_report.get("ssl", {}).get("valid_until")),
+        ("TLS grade", old_report.get("tls_capabilities", {}).get("grade"), new_report.get("tls_capabilities", {}).get("grade")),
+        ("ASN", old_report.get("ip_intelligence", {}).get("asn"), new_report.get("ip_intelligence", {}).get("asn")),
+        ("Security header grade", old_report.get("security_header_quality", {}).get("grade"), new_report.get("security_header_quality", {}).get("grade")),
         ("Title", old_report.get("https", {}).get("seo", {}).get("title"), new_report.get("https", {}).get("seo", {}).get("title")),
         ("Canonical", old_report.get("https", {}).get("seo", {}).get("canonical"), new_report.get("https", {}).get("seo", {}).get("canonical")),
         ("Health score", old_report.get("health", {}).get("score"), new_report.get("health", {}).get("score")),
@@ -1844,6 +2171,9 @@ def run_scan(domain: str):
         status.write("Inspecting SSL/TLS certificate...")
         report["ssl"] = check_ssl(domain)
 
+        status.write("Auditing supported TLS protocol versions...")
+        report["tls_capabilities"] = check_tls_capabilities(domain, report["ssl"])
+
         status.write("Retrieving RDAP registration data...")
         report["rdap"] = check_rdap(domain)
 
@@ -1875,6 +2205,7 @@ def run_scan(domain: str):
 
         status.write("Evaluating security headers...")
         report["security_headers"] = security_headers(report["https"].get("headers", {}))
+        report["security_header_quality"] = analyze_security_header_quality(report["https"].get("headers", {}))
         report["cloudflare"] = detect_cloudflare(report["dns"], report["https"])
 
         status.write("Collecting passive IP / ASN intelligence...")
@@ -1883,6 +2214,20 @@ def run_scan(domain: str):
         status.write("Analyzing indexability and performance...")
         report["indexability"] = analyze_indexability(report)
         report["performance"] = analyze_performance(report)
+
+        status.write("Measuring DNS/TCP/TLS/TTFB timing...")
+        if report["ssl"].get("valid") and report["https"].get("status_code") is not None:
+            report["network_timing"] = measure_network_timing(domain)
+        else:
+            report["network_timing"] = {
+                "dns_ms": None,
+                "tcp_connect_ms": None,
+                "tls_handshake_ms": None,
+                "ttfb_ms": None,
+                "total_ms": None,
+                "target_ip": None,
+                "error": "Timing probe dilewati karena HTTPS/TLS dasar tidak berhasil.",
+            }
 
         status.write("Calculating health and category scores...")
         report["health"] = build_health(report)
@@ -2102,6 +2447,23 @@ def render_performance(report):
         )
 
 
+    timing = report.get("network_timing", {})
+    st.subheader("Network Timing Breakdown")
+    st.caption("Best-effort probe ke HTTPS root. Nilai ini terpisah dari response_time_ms legacy dan tidak mengubah Health Score.")
+
+    tcols = st.columns(5)
+    tcols[0].metric("DNS Lookup", f'{timing.get("dns_ms")} ms' if timing.get("dns_ms") is not None else "-")
+    tcols[1].metric("TCP Connect", f'{timing.get("tcp_connect_ms")} ms' if timing.get("tcp_connect_ms") is not None else "-")
+    tcols[2].metric("TLS Handshake", f'{timing.get("tls_handshake_ms")} ms' if timing.get("tls_handshake_ms") is not None else "-")
+    tcols[3].metric("TTFB", f'{timing.get("ttfb_ms")} ms' if timing.get("ttfb_ms") is not None else "-")
+    tcols[4].metric("Probe Total", f'{timing.get("total_ms")} ms' if timing.get("total_ms") is not None else "-")
+
+    if timing.get("target_ip"):
+        st.caption(f'Timing target IP: {timing.get("target_ip")}')
+    if timing.get("error"):
+        st.info(f'Network timing note: {timing.get("error")}')
+
+
 def render_compare(report):
     previous = st.session_state.get("previous_report")
 
@@ -2237,6 +2599,28 @@ def render_ssl(report):
     st.code(json.dumps(data.get("san", []), indent=2, ensure_ascii=False), language="json")
 
 
+    caps = report.get("tls_capabilities", {})
+    st.subheader("TLS Protocol Audit")
+    st.caption("Best-effort protocol negotiation test. Tidak mengubah validasi sertifikat/Health Score yang sudah ada.")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("TLS Grade", caps.get("grade") or "Unknown")
+    c2.metric("Modern TLS", "YES" if caps.get("modern_tls") else "NO")
+    c3.metric("Weak Protocol", "DETECTED" if caps.get("weak_protocol_detected") else "Not detected")
+
+    rows = []
+    for protocol, info in (caps.get("protocols") or {}).items():
+        rows.append({
+            "Protocol": protocol,
+            "Status": info.get("status", "UNKNOWN"),
+            "Cipher": info.get("cipher") or "-",
+        })
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+    if caps.get("note"):
+        st.info(caps["note"])
+
+
 def render_rdap(report):
     data = report["rdap"]
 
@@ -2336,6 +2720,25 @@ def render_seo(report):
 
 
 def render_security(report):
+    quality = report.get("security_header_quality", {})
+    st.subheader("Security Header Quality")
+    q1, q2 = st.columns(2)
+    q1.metric("Header Grade", quality.get("grade") or "Unknown")
+    q2.metric("Quality Score", f'{quality.get("score")}/100' if quality.get("score") is not None else "-")
+
+    findings = quality.get("findings") or []
+    if not findings:
+        st.success("Tidak ada warning kualitas header tambahan yang terdeteksi.")
+    else:
+        for item in findings:
+            text = f'**{item.get("header", "Header")}** — {item.get("message", "")}'
+            if item.get("severity") == "MEDIUM":
+                st.warning(text)
+            else:
+                st.info(text)
+
+    st.divider()
+    st.subheader("Header Presence & Values")
     for name, data in report["security_headers"].items():
         c1, c2 = st.columns([0.28, 0.72])
 
@@ -2412,6 +2815,26 @@ def render_ip_intelligence(report):
 
     st.write("**All resolved public IPs:**")
     st.code(json.dumps(data.get("all_ips") or [], indent=2, ensure_ascii=False), language="json")
+
+    details = data.get("ip_details") or []
+    if details:
+        st.subheader("Per-IP Network Details")
+        st.dataframe(
+            [
+                {
+                    "IP": item.get("ip"),
+                    "IP Version": item.get("version"),
+                    "ASN": f'AS{item.get("asn")}' if item.get("asn") else "-",
+                    "Network": item.get("network") or "-",
+                    "Country": item.get("country") or "-",
+                    "Organization": item.get("organization") or "-",
+                    "PTR": item.get("reverse_dns") or "-",
+                }
+                for item in details
+            ],
+            width="stretch",
+            hide_index=True,
+        )
 
     if cf.get("detected"):
         st.info("Cloudflare terdeteksi. IP/ASN yang tampil dapat merupakan edge/proxy Cloudflare, bukan origin server.")
@@ -2579,7 +3002,7 @@ def bulk_nawala_check(domain: str):
     return value
 
 
-def bulk_light_scan(raw_domain: str, include_nawala=False):
+def bulk_light_scan(raw_domain: str, include_nawala=False, http_session=None):
     domain = None
     nawala = {"status": "-", "http": None}
 
@@ -2611,7 +3034,7 @@ def bulk_light_scan(raw_domain: str, include_nawala=False):
     dns_a = safe_dns_resolve(domain, "A")
     ip = dns_a[0] if dns_a and isinstance(dns_a[0], str) else None
 
-    https = check_http(f"https://{domain}")
+    https = check_http(f"https://{domain}", http_session=http_session)
     ssl_data = check_ssl(domain)
 
     code = https.get("status_code")
@@ -2635,6 +3058,64 @@ def bulk_light_scan(raw_domain: str, include_nawala=False):
         "final_url": https.get("final_url"),
         "error": https.get("error") or ssl_data.get("error"),
     }
+
+
+def run_bulk_scans_parallel(domains, include_nawala=False, max_workers=BULK_MAX_WORKERS):
+    """Parallelize only technical checks; provider-backed Nawala calls stay controlled."""
+    nawala_by_index = {}
+
+    if include_nawala:
+        for idx, raw_domain in enumerate(domains):
+            try:
+                normalized = normalize_domain(raw_domain)
+                nawala_by_index[idx] = bulk_nawala_check(normalized)
+            except Exception as exc:
+                nawala_by_index[idx] = {"status": "ERROR", "http": None, "error": str(exc)}
+
+    rows = [None] * len(domains)
+
+    def worker(index, raw_domain):
+        local_session = requests.Session()
+        local_session.headers.update({"User-Agent": USER_AGENT})
+        try:
+            row = bulk_light_scan(raw_domain, include_nawala=False, http_session=local_session)
+            return index, row
+        finally:
+            local_session.close()
+
+    workers = max(1, min(int(max_workers), len(domains) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(worker, idx, domain): (idx, domain)
+            for idx, domain in enumerate(domains)
+        }
+        for future in as_completed(future_map):
+            fallback_idx, fallback_domain = future_map[future]
+            try:
+                idx, row = future.result()
+            except Exception as exc:
+                idx = fallback_idx
+                row = {
+                    "domain": fallback_domain,
+                    "nawala": "-",
+                    "nawala_http": None,
+                    "status": "OFFLINE / ERROR",
+                    "https": None,
+                    "ip": None,
+                    "response_ms": None,
+                    "ssl": None,
+                    "ssl_days": None,
+                    "final_url": None,
+                    "error": f"Bulk worker error: {exc}",
+                }
+
+            if include_nawala:
+                nw = nawala_by_index.get(idx, {"status": "-", "http": None})
+                row["nawala"] = nw.get("status", "-")
+                row["nawala_http"] = nw.get("http")
+            rows[idx] = row
+
+    return rows
 
 
 # =========================================================
@@ -2827,7 +3308,7 @@ with main_tabs[0]:
             )
 
             lines = [
-                "DOMAIN CHECKER PRO V7 REPORT",
+                "DOMAIN CHECKER PRO V8 REPORT",
                 f"Domain: {report['domain']}",
                 f"Checked: {report['checked_at']}",
                 f"Health Score: {report['health']['score']}/100",
@@ -2920,16 +3401,16 @@ with main_tabs[1]:
             if not domains:
                 st.warning("Masukkan minimal satu domain.")
             else:
-                rows = []
                 progress = st.progress(0, text="Starting bulk scan...")
+                progress.progress(0.15, text="Preparing provider checks and technical workers...")
 
-                for idx, domain in enumerate(domains, start=1):
-                    progress.progress(
-                        idx / len(domains),
-                        text=f"Checking {domain} ({idx}/{len(domains)})",
-                    )
-                    rows.append(bulk_light_scan(domain, include_nawala=bulk_include_nawala))
+                rows = run_bulk_scans_parallel(
+                    domains,
+                    include_nawala=bulk_include_nawala,
+                    max_workers=BULK_MAX_WORKERS,
+                )
 
+                progress.progress(1.0, text=f"Completed {len(domains)} domain(s)")
                 progress.empty()
                 st.session_state["bulk_results"] = rows
 
@@ -2993,7 +3474,7 @@ Pemeriksaan mencakup **DNS record**, **IPv4/IPv6**, **HTTP/HTTPS status**,
 **redirect chain**, **SSL/TLS certificate**, **DNSSEC**, **nameserver**,
 **MX/SPF/DMARC**, **RDAP dan masa berlaku domain**, **SEO dan indexability dasar**,
 **robots.txt**, **sitemap.xml**, **security headers**, **response time**,
-**infrastruktur/CDN**, serta **DNS propagation** melalui beberapa resolver publik.
+**infrastruktur/CDN**, **IP intelligence**, **TLS protocol audit**, **network timing/TTFB**, serta **DNS propagation** melalui beberapa resolver publik.
 
 ### Kapan Checker Domain Berguna?
 
@@ -3287,7 +3768,7 @@ def check_ahrefs_authority(domain: str):
     return result
 
 
-def check_authority_metrics(domain: str):
+def _check_authority_metrics_uncached(domain: str):
     validate_public_target(domain)
 
     return {
@@ -3295,7 +3776,28 @@ def check_authority_metrics(domain: str):
         "moz": check_moz_authority(domain),
         "majestic": check_majestic_authority(domain),
         "ahrefs": check_ahrefs_authority(domain),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "cache_hit": False,
     }
+
+
+def check_authority_metrics(domain: str):
+    """Six-hour per-session cache to protect paid/limited authority API quota."""
+    validate_public_target(domain)
+    cache = st.session_state.setdefault("authority_cache", {})
+    key = domain.lower().rstrip(".")
+    now = time.time()
+    cached = cache.get(key)
+
+    if cached and now - cached.get("ts", 0) < AUTHORITY_CACHE_TTL_SECONDS:
+        value = dict(cached.get("value") or {})
+        value["cache_hit"] = True
+        return value
+
+    value = _check_authority_metrics_uncached(domain)
+    cache[key] = {"ts": now, "value": dict(value)}
+    st.session_state["authority_cache"] = cache
+    return value
 
 
 st.divider()
@@ -3330,6 +3832,8 @@ authority_result = st.session_state.get("authority_metrics_result")
 
 if authority_result:
     st.caption(f"Authority metrics untuk: {authority_result.get('domain', '-')}")
+    if authority_result.get("cache_hit"):
+        st.caption("Authority metrics diambil dari cache sesi (maks. 6 jam) untuk menghemat kuota API provider.")
 
     moz_data = authority_result.get("moz", {})
     majestic_data = authority_result.get("majestic", {})
