@@ -3057,7 +3057,7 @@ def check_nawala_status(domain: str):
     # =====================================================
     try:
         primary_response = requests.get(
-            "https://nawalacheck.com/api",
+            "https://api.nawalacheck.com/api/",
             params={"domain": domain},
             headers={
                 "X-API-Key": api_key,
