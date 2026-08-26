@@ -1,4 +1,4 @@
-import csv
+
 import io
 import ipaddress
 import json
@@ -44,7 +44,7 @@ BULK_SCAN_WINDOW_SECONDS = 60
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151 Safari/537.36 DomainCheckerPro/8.0"
+    "Chrome/151 Safari/537.36 DomainCheckerPro/8.1"
 )
 
 session = requests.Session()
@@ -427,6 +427,51 @@ def resolve_host_ips(host: str):
     return sorted(ips)
 
 
+def validate_target_input(host: str):
+    """
+    Validate user-supplied target WITHOUT requiring DNS resolution.
+
+    This keeps localhost/private/internal protections for direct IP/hostname input,
+    while allowing an unresolved public domain to continue into DNS/RDAP diagnostics.
+    Network connections still use validate_public_target() before connecting.
+    """
+    host_lower = (host or "").lower().rstrip(".")
+
+    if not host_lower:
+        raise ValueError("Domain belum diisi.")
+
+    if host_lower in BLOCKED_HOSTS:
+        raise ValueError("Target lokal/internal tidak diizinkan.")
+
+    if any(host_lower.endswith(suffix) for suffix in BLOCKED_SUFFIXES):
+        raise ValueError("Hostname lokal/internal tidak diizinkan.")
+
+    # Preserve support for direct public-IP input, but reject non-public literals.
+    try:
+        ip = ipaddress.ip_address(host_lower)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        if not ip.is_global:
+            raise ValueError("IP private, loopback, link-local, reserved, atau non-public tidak diizinkan.")
+        return host_lower
+
+    if len(host_lower) > 253:
+        raise ValueError("Nama domain terlalu panjang.")
+
+    # Basic hostname syntax validation. Resolution is intentionally NOT required here.
+    labels = host_lower.split(".")
+    if len(labels) < 2:
+        raise ValueError("Format domain tidak valid.")
+
+    label_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.I)
+    if any(not label_re.fullmatch(label) for label in labels):
+        raise ValueError("Format domain tidak valid.")
+
+    return host_lower
+
+
 def validate_public_target(host: str):
     host_lower = host.lower().rstrip(".")
 
@@ -699,7 +744,7 @@ def safe_dns_resolve(domain: str, record_type: str):
 
 
 def check_dns(domain: str):
-    validate_public_target(domain)
+    validate_target_input(domain)
 
     types = ["A", "AAAA", "CNAME", "NS", "MX", "TXT", "CAA", "SOA", "DS"]
     data = {rtype: safe_dns_resolve(domain, rtype) for rtype in types}
@@ -774,7 +819,7 @@ def resolve_with_nameservers(domain: str, record_type: str, nameservers):
 
 
 def check_dns_propagation(domain: str):
-    validate_public_target(domain)
+    validate_target_input(domain)
 
     result = {}
 
@@ -936,7 +981,11 @@ def check_http(url: str, http_session=None):
                 result["seo"] = {}
 
     except ValueError as exc:
-        result["error"] = f"Blocked target: {exc}"
+        message = str(exc)
+        if message.startswith("DNS resolve gagal:") or message == "Domain tidak resolve ke IP.":
+            result["error"] = f"DNS resolution error: {message}"
+        else:
+            result["error"] = f"Blocked target: {message}"
     except requests.exceptions.SSLError as exc:
         result["error"] = f"SSL error: {exc}"
     except requests.exceptions.ConnectTimeout:
@@ -2144,7 +2193,7 @@ def build_health(report):
 # =========================================================
 
 def run_scan(domain: str):
-    validate_public_target(domain)
+    validate_target_input(domain)
 
     report = {
         "domain": domain,
@@ -2152,8 +2201,8 @@ def run_scan(domain: str):
     }
 
     with st.status("Menjalankan domain analysis...", expanded=True) as status:
-        status.write("Validating public target...")
-        validate_public_target(domain)
+        status.write("Validating target input...")
+        validate_target_input(domain)
 
         status.write("Resolving DNS records...")
         report["dns"] = check_dns(domain)
@@ -3195,7 +3244,7 @@ if scan_clicked:
     else:
         try:
             normalized = normalize_domain(domain_input)
-            validate_public_target(normalized)
+            validate_target_input(normalized)
 
             previous = st.session_state["last_reports_by_domain"].get(normalized)
             report = run_scan(normalized)
@@ -3308,7 +3357,7 @@ with main_tabs[0]:
             )
 
             lines = [
-                "DOMAIN CHECKER PRO V8 REPORT",
+                "DOMAIN CHECKER PRO V8.1 REPORT",
                 f"Domain: {report['domain']}",
                 f"Checked: {report['checked_at']}",
                 f"Health Score: {report['health']['score']}/100",
