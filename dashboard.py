@@ -2190,13 +2190,135 @@ def add_history(report):
 # BULK SCAN
 # =========================================================
 
-def bulk_light_scan(raw_domain: str):
+def bulk_nawala_check(domain: str):
+    """
+    Lightweight Nawala check khusus Bulk Scan.
+    Menggunakan endpoint resmi NawalaCheck dan 1 API request per domain.
+    """
+    result = {
+        "status": "-",
+        "http": None,
+    }
+
+    # Proteksi input lokal/internal tetap dipertahankan.
+    host = (domain or "").strip().lower().rstrip(".")
+
+    if not host:
+        result["status"] = "INVALID"
+        return result
+
+    if host in BLOCKED_HOSTS or any(host.endswith(suffix) for suffix in BLOCKED_SUFFIXES):
+        result["status"] = "BLOCKED INPUT"
+        return result
+
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        result["status"] = "INVALID"
+        return result
+
+    try:
+        api_key = str(st.secrets.get("NAWALA_API_KEY", "")).strip()
+    except Exception:
+        api_key = ""
+
+    if not api_key:
+        result["status"] = "NOT CONFIGURED"
+        return result
+
+    try:
+        response = requests.get(
+            "https://api.nawalacheck.com/api/",
+            params={"domain": host},
+            headers={
+                "X-API-Key": api_key,
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
+
+        result["http"] = response.status_code
+
+        if response.status_code == 429:
+            result["status"] = "LIMIT"
+            return result
+
+        if response.status_code != 200:
+            result["status"] = "UNKNOWN"
+            return result
+
+        try:
+            payload = response.json()
+        except ValueError:
+            result["status"] = "UNKNOWN"
+            return result
+
+        domain_key = host.lower().rstrip(".")
+        row = None
+
+        if isinstance(payload, dict):
+            row = payload.get(domain_key) or payload.get(host)
+
+            if row is None:
+                for key, value in payload.items():
+                    if str(key).lower().rstrip(".") == domain_key:
+                        row = value
+                        break
+
+        if not isinstance(row, dict):
+            result["status"] = "UNKNOWN"
+            return result
+
+        blocked = row.get("blocked")
+
+        if isinstance(blocked, bool):
+            result["status"] = "DIBLOKIR" if blocked else "AMAN"
+        elif isinstance(blocked, (int, float)) and blocked in (0, 1):
+            result["status"] = "DIBLOKIR" if bool(blocked) else "AMAN"
+        elif isinstance(blocked, str):
+            normalized = blocked.strip().lower()
+            if normalized in {"true", "1", "yes", "blocked", "blokir", "diblokir"}:
+                result["status"] = "DIBLOKIR"
+            elif normalized in {"false", "0", "no", "safe", "clear", "aman", "unblocked"}:
+                result["status"] = "AMAN"
+            else:
+                result["status"] = "UNKNOWN"
+        else:
+            result["status"] = "UNKNOWN"
+
+    except requests.Timeout:
+        result["status"] = "TIMEOUT"
+    except requests.RequestException:
+        result["status"] = "ERROR"
+    except Exception:
+        result["status"] = "ERROR"
+
+    return result
+
+
+def bulk_light_scan(raw_domain: str, include_nawala=False):
+    domain = None
+    nawala = {"status": "-", "http": None}
+
     try:
         domain = normalize_domain(raw_domain)
+
+        # Nawala tidak membutuhkan domain sudah resolve ke IP.
+        # Jadi status Nawala tetap bisa dicoba meskipun pemeriksaan teknis lain gagal DNS.
+        if include_nawala:
+            nawala = bulk_nawala_check(domain)
+
         validate_public_target(domain)
+
     except Exception as exc:
         return {
-            "domain": raw_domain,
+            "domain": domain or raw_domain,
+            "nawala": nawala.get("status", "-"),
+            "nawala_http": nawala.get("http"),
             "status": "BLOCKED / INVALID",
             "https": None,
             "ip": None,
@@ -2223,6 +2345,8 @@ def bulk_light_scan(raw_domain: str):
 
     return {
         "domain": domain,
+        "nawala": nawala.get("status", "-"),
+        "nawala_http": nawala.get("http"),
         "status": status,
         "https": code,
         "ip": ip,
@@ -2475,6 +2599,19 @@ with main_tabs[1]:
         key="bulk_domains",
     )
 
+    bulk_include_nawala = st.checkbox(
+        "Sertakan Nawala Status",
+        value=False,
+        help="Menggunakan 1 request NawalaCheck untuk setiap domain di Bulk Scan.",
+        key="bulk_include_nawala",
+    )
+
+    if bulk_include_nawala:
+        st.caption(
+            "Nawala Bulk aktif: setiap domain memakai 1 request API NawalaCheck. "
+            "Jika limit provider tercapai, kolom Nawala akan menampilkan LIMIT."
+        )
+
     if st.button("Run Bulk Scan", width="content"):
         allowed, wait_seconds = check_rate_limit(
             "bulk_scan_times",
@@ -2508,7 +2645,7 @@ with main_tabs[1]:
                         idx / len(domains),
                         text=f"Checking {domain} ({idx}/{len(domains)})",
                     )
-                    rows.append(bulk_light_scan(domain))
+                    rows.append(bulk_light_scan(domain, include_nawala=bulk_include_nawala))
 
                 progress.empty()
                 st.session_state["bulk_results"] = rows
