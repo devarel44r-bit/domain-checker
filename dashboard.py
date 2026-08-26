@@ -2991,6 +2991,52 @@ def _nawala_api_key_configured(value):
     return True
 
 
+def validate_nawala_domain(domain: str):
+    """
+    Validasi khusus input Nawala.
+
+    Berbeda dari validate_public_target(), fungsi ini TIDAK mewajibkan domain
+    sudah resolve ke IP. Ini penting karena domain yang DNS-nya sedang mati,
+    belum pointing, atau sudah tidak aktif tetap bisa ditanyakan statusnya
+    ke API NawalaCheck.
+
+    Proteksi target lokal/internal tetap dipertahankan.
+    """
+    host = (domain or "").strip().lower().rstrip(".")
+
+    if not host:
+        raise ValueError("Domain belum diisi.")
+
+    if host in BLOCKED_HOSTS:
+        raise ValueError("Target lokal/internal tidak diizinkan.")
+
+    if any(host.endswith(suffix) for suffix in BLOCKED_SUFFIXES):
+        raise ValueError("Hostname lokal/internal tidak diizinkan.")
+
+    # Nawala checker ditujukan untuk hostname/domain, bukan IP literal.
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Masukkan nama domain, bukan alamat IP.")
+
+    if len(host) > 253:
+        raise ValueError("Nama domain terlalu panjang.")
+
+    labels = host.split(".")
+    if len(labels) < 2:
+        raise ValueError("Format domain tidak valid.")
+
+    label_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.I)
+
+    for label in labels:
+        if not label_re.fullmatch(label):
+            raise ValueError("Format domain tidak valid.")
+
+    return host
+
+
 def check_nawala_status(domain: str):
     """
     Cek status blokir domain Indonesia.
@@ -3020,7 +3066,7 @@ def check_nawala_status(domain: str):
         return result
 
     result["configured"] = True
-    validate_public_target(domain)
+    domain = validate_nawala_domain(domain)
 
     def apply_blocked(value):
         if isinstance(value, bool):
@@ -3200,7 +3246,7 @@ nawala_domain_input = st.text_input(
 if st.button("Check Nawala Status", width="content"):
     try:
         nawala_domain = normalize_domain(nawala_domain_input)
-        validate_public_target(nawala_domain)
+        nawala_domain = validate_nawala_domain(nawala_domain)
 
         with st.spinner("Mengecek status Nawala / akses Indonesia..."):
             st.session_state["nawala_check_result"] = check_nawala_status(nawala_domain)
