@@ -2964,3 +2964,200 @@ if authority_result:
         "Moz, Majestic, dan Ahrefs adalah metric milik provider masing-masing. "
         "Tidak ada nilai authority yang dibuat atau diperkirakan oleh aplikasi ini."
     )
+
+# =========================================================
+# NAWALA / INDONESIA BLOCK CHECK (ADDED ONLY - EXISTING CODE ABOVE UNCHANGED)
+# =========================================================
+
+def _nawala_api_key_configured(value):
+    """Return False for empty/example Nawala API key values."""
+    if not value:
+        return False
+
+    text = str(value).strip()
+    upper = text.upper()
+
+    if upper in {
+        "NAWALA_API_KEY_LU",
+        "API_KEY_NAWALA_ASLI",
+        "ISI_API_KEY_NAWALA_ASLI",
+        "NAWALA_API_KEY_ANDA",
+    }:
+        return False
+
+    if upper.startswith(("ISI_", "PASTE_", "YOUR_", "CONTOH_", "EXAMPLE_")):
+        return False
+
+    return True
+
+
+def check_nawala_status(domain: str):
+    """
+    Check Indonesia block/access status through the NawalaCheck third-party API.
+
+    This does not modify or bypass any blocking system. It only reports the
+    status returned by the external provider for a public domain.
+    """
+    result = {
+        "domain": domain,
+        "blocked": None,
+        "status": "UNKNOWN",
+        "configured": False,
+        "provider": "NawalaCheck",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "http_status": None,
+        "error": None,
+    }
+
+    api_key = _get_streamlit_secret("NAWALA_API_KEY")
+
+    if not _nawala_api_key_configured(api_key):
+        return result
+
+    result["configured"] = True
+
+    try:
+        validate_public_target(domain)
+
+        response = requests.get(
+            "https://nawalacheck.com/api",
+            params={"domain": domain},
+            headers={
+                "X-API-Key": api_key,
+                "Accept": "application/json",
+            },
+            timeout=TIMEOUT,
+        )
+
+        result["http_status"] = response.status_code
+
+        if response.status_code != 200:
+            if response.status_code in (401, 403):
+                result["error"] = (
+                    "NawalaCheck menolak API key/request. Periksa NAWALA_API_KEY, "
+                    "status akun, limit, atau pengaturan akses provider."
+                )
+            elif response.status_code == 429:
+                result["error"] = "Limit request NawalaCheck tercapai. Coba lagi setelah limit provider reset."
+            else:
+                result["error"] = f"NawalaCheck API HTTP {response.status_code}."
+            return result
+
+        try:
+            payload = response.json()
+        except ValueError:
+            result["error"] = "Respons NawalaCheck bukan JSON yang valid."
+            return result
+
+        domain_key = domain.lower().rstrip(".")
+        row = None
+
+        if isinstance(payload, dict):
+            row = payload.get(domain_key) or payload.get(domain)
+
+            if row is None:
+                # Be tolerant if the provider normalizes the returned key.
+                for key, value in payload.items():
+                    if str(key).lower().rstrip(".") == domain_key:
+                        row = value
+                        break
+
+        if not isinstance(row, dict):
+            result["error"] = "NawalaCheck tidak mengembalikan status domain yang dapat dibaca."
+            return result
+
+        blocked = row.get("blocked")
+
+        if isinstance(blocked, bool):
+            result["blocked"] = blocked
+        elif isinstance(blocked, (int, float)) and blocked in (0, 1):
+            result["blocked"] = bool(blocked)
+        elif isinstance(blocked, str):
+            normalized = blocked.strip().lower()
+            if normalized in {"true", "1", "yes", "blocked", "blokir", "diblokir"}:
+                result["blocked"] = True
+            elif normalized in {"false", "0", "no", "safe", "clear", "aman", "unblocked"}:
+                result["blocked"] = False
+
+        if result["blocked"] is True:
+            result["status"] = "DIBLOKIR"
+        elif result["blocked"] is False:
+            result["status"] = "AMAN"
+        else:
+            result["status"] = "UNKNOWN"
+            result["error"] = "Field status blokir tidak ditemukan pada respons provider."
+
+    except requests.Timeout:
+        result["error"] = "NawalaCheck timeout. Provider tidak menjawab dalam batas waktu."
+    except requests.RequestException:
+        result["error"] = "NawalaCheck sedang tidak dapat dihubungi."
+    except Exception as exc:
+        result["error"] = f"Status Nawala belum dapat dimuat: {exc}"
+
+    return result
+
+
+st.divider()
+st.subheader("Nawala / Indonesia Block Check")
+st.caption(
+    "Cek status akses/blokir domain di Indonesia melalui NawalaCheck. "
+    "NawalaCheck adalah provider pihak ketiga, bukan API resmi Komdigi."
+)
+
+nawala_domain_input = st.text_input(
+    "Domain untuk Nawala Check",
+    value=(domain_input or "").strip(),
+    placeholder="example.com",
+    key="nawala_domain_input",
+)
+
+if st.button("Check Nawala Status", width="content"):
+    try:
+        nawala_domain = normalize_domain(nawala_domain_input)
+        validate_public_target(nawala_domain)
+
+        with st.spinner("Mengecek status Nawala / akses Indonesia..."):
+            st.session_state["nawala_check_result"] = check_nawala_status(nawala_domain)
+
+    except ValueError as exc:
+        st.error(f"Target ditolak: {exc}")
+    except Exception as exc:
+        st.error(f"Nawala check gagal: {exc}")
+
+
+nawala_result = st.session_state.get("nawala_check_result")
+
+if nawala_result:
+    st.caption(f"Nawala check untuk: {nawala_result.get('domain', '-')}")
+
+    blocked = nawala_result.get("blocked")
+    status_text = nawala_result.get("status", "UNKNOWN")
+
+    if blocked is True:
+        status_help = "Provider melaporkan domain terblokir."
+    elif blocked is False:
+        status_help = "Provider tidak melaporkan domain sebagai terblokir."
+    else:
+        status_help = "Status belum dapat dipastikan."
+
+    cols = st.columns(4)
+    cols[0].metric("Indonesia Block Status", status_text, help=status_help)
+    cols[1].metric("Blocked", "YES" if blocked is True else "NO" if blocked is False else "-")
+    cols[2].metric("Provider", nawala_result.get("provider", "NawalaCheck"))
+    cols[3].metric("API HTTP", nawala_result.get("http_status") or "-")
+
+    if not nawala_result.get("configured"):
+        st.info(
+            "Nawala Check belum aktif. Tambahkan NAWALA_API_KEY yang valid di Streamlit Secrets."
+        )
+    elif nawala_result.get("error"):
+        st.warning(nawala_result["error"])
+    elif blocked is True:
+        st.error("Provider melaporkan domain ini sebagai DIBLOKIR pada pengecekan akses Indonesia.")
+    elif blocked is False:
+        st.success("Provider tidak melaporkan domain ini sebagai terblokir pada pengecekan saat ini.")
+
+    st.caption(
+        "Hasil ini mengikuti respons NawalaCheck pada waktu pengecekan dan bukan keputusan resmi hukum/regulator. "
+        "Gunakan sebagai sinyal monitoring tambahan, bukan satu-satunya dasar keputusan."
+    )
