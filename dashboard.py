@@ -2993,10 +2993,17 @@ def _nawala_api_key_configured(value):
 
 def check_nawala_status(domain: str):
     """
-    Check Indonesia block/access status through the NawalaCheck third-party API.
+    Cek status blokir domain Indonesia.
 
-    This does not modify or bypass any blocking system. It only reports the
-    status returned by the external provider for a public domain.
+    Primary:
+    - NawalaCheck (menggunakan NAWALA_API_KEY dari Streamlit Secrets)
+
+    Fallback:
+    - AetherCloud Nawala Checker API jika endpoint NawalaCheck mengembalikan 404
+      atau sedang tidak tersedia.
+
+    Fungsi ini hanya membaca status dari provider eksternal dan tidak mengubah
+    mekanisme blocking apa pun.
     """
     result = {
         "domain": domain,
@@ -3006,6 +3013,8 @@ def check_nawala_status(domain: str):
         "provider": "NawalaCheck",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "http_status": None,
+        "primary_http_status": None,
+        "fallback_used": False,
         "error": None,
     }
 
@@ -3016,83 +3025,211 @@ def check_nawala_status(domain: str):
 
     result["configured"] = True
 
+    def set_blocked(value):
+        if isinstance(value, bool):
+            blocked_value = value
+        elif isinstance(value, (int, float)) and value in (0, 1):
+            blocked_value = bool(value)
+        elif isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {
+                "true", "1", "yes", "blocked", "blokir", "diblokir",
+                "unsafe", "ada",
+            }:
+                blocked_value = True
+            elif normalized in {
+                "false", "0", "no", "safe", "clear", "aman",
+                "unblocked", "clean", "tidak ada",
+            }:
+                blocked_value = False
+            else:
+                return False
+        else:
+            return False
+
+        result["blocked"] = blocked_value
+        result["status"] = "DIBLOKIR" if blocked_value else "AMAN"
+        result["error"] = None
+        return True
+
+    # ---------------------------------------------------------
+    # PRIMARY: NawalaCheck
+    # Dokumentasi provider: GET /api?domain=example.com
+    # Header: X-API-Key
+    # ---------------------------------------------------------
+    primary_failed_for_fallback = False
+
     try:
         validate_public_target(domain)
 
         response = requests.get(
-            "https://nawalacheck.com/api/",
+            "https://nawalacheck.com/api",
             params={"domain": domain},
             headers={
                 "X-API-Key": api_key,
                 "Accept": "application/json",
+                "User-Agent": USER_AGENT,
             },
             timeout=TIMEOUT,
+            allow_redirects=False,
         )
 
+        result["primary_http_status"] = response.status_code
         result["http_status"] = response.status_code
 
-        if response.status_code != 200:
-            if response.status_code in (401, 403):
-                result["error"] = (
-                    "NawalaCheck menolak API key/request. Periksa NAWALA_API_KEY, "
-                    "status akun, limit, atau pengaturan akses provider."
-                )
-            elif response.status_code == 429:
-                result["error"] = "Limit request NawalaCheck tercapai. Coba lagi setelah limit provider reset."
-            else:
-                result["error"] = f"NawalaCheck API HTTP {response.status_code}."
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+
+            domain_key = domain.lower().rstrip(".")
+            row = None
+
+            if isinstance(payload, dict):
+                row = payload.get(domain_key) or payload.get(domain)
+
+                if row is None:
+                    for key, value in payload.items():
+                        if str(key).lower().rstrip(".") == domain_key:
+                            row = value
+                            break
+
+            if isinstance(row, dict) and set_blocked(row.get("blocked")):
+                return result
+
+            result["error"] = (
+                "Respons NawalaCheck HTTP 200 diterima, tetapi field status blokir "
+                "tidak dapat dibaca."
+            )
+            primary_failed_for_fallback = True
+
+        elif response.status_code in (401, 403):
+            result["error"] = (
+                "NawalaCheck menolak API key/request. Periksa NAWALA_API_KEY, "
+                "status akun, atau whitelist IP."
+            )
             return result
 
-        try:
-            payload = response.json()
-        except ValueError:
-            result["error"] = "Respons NawalaCheck bukan JSON yang valid."
+        elif response.status_code == 429:
+            result["error"] = (
+                "Limit request NawalaCheck tercapai. Coba lagi setelah limit provider reset."
+            )
             return result
 
-        domain_key = domain.lower().rstrip(".")
-        row = None
+        elif response.status_code == 404:
+            # Endpoint NawalaCheck saat ini mengembalikan 404 dari deployment Streamlit.
+            # Lanjut ke fallback agar checker tetap menghasilkan status.
+            primary_failed_for_fallback = True
 
-        if isinstance(payload, dict):
-            row = payload.get(domain_key) or payload.get(domain)
+        elif response.status_code >= 500:
+            primary_failed_for_fallback = True
 
-            if row is None:
-                # Be tolerant if the provider normalizes the returned key.
-                for key, value in payload.items():
-                    if str(key).lower().rstrip(".") == domain_key:
-                        row = value
-                        break
-
-        if not isinstance(row, dict):
-            result["error"] = "NawalaCheck tidak mengembalikan status domain yang dapat dibaca."
-            return result
-
-        blocked = row.get("blocked")
-
-        if isinstance(blocked, bool):
-            result["blocked"] = blocked
-        elif isinstance(blocked, (int, float)) and blocked in (0, 1):
-            result["blocked"] = bool(blocked)
-        elif isinstance(blocked, str):
-            normalized = blocked.strip().lower()
-            if normalized in {"true", "1", "yes", "blocked", "blokir", "diblokir"}:
-                result["blocked"] = True
-            elif normalized in {"false", "0", "no", "safe", "clear", "aman", "unblocked"}:
-                result["blocked"] = False
-
-        if result["blocked"] is True:
-            result["status"] = "DIBLOKIR"
-        elif result["blocked"] is False:
-            result["status"] = "AMAN"
         else:
-            result["status"] = "UNKNOWN"
-            result["error"] = "Field status blokir tidak ditemukan pada respons provider."
+            result["error"] = f"NawalaCheck API HTTP {response.status_code}."
+            primary_failed_for_fallback = True
 
-    except requests.Timeout:
-        result["error"] = "NawalaCheck timeout. Provider tidak menjawab dalam batas waktu."
+    except (requests.Timeout, requests.ConnectionError):
+        primary_failed_for_fallback = True
     except requests.RequestException:
-        result["error"] = "NawalaCheck sedang tidak dapat dihubungi."
+        primary_failed_for_fallback = True
     except Exception as exc:
         result["error"] = f"Status Nawala belum dapat dimuat: {exc}"
+        primary_failed_for_fallback = True
+
+    # ---------------------------------------------------------
+    # FALLBACK: AetherCloud Nawala Checker API
+    # GET /check?domain=DOMAIN
+    # Response: {"results":[{"domain":"...","status":"SAFE|BLOCKED"}]}
+    # ---------------------------------------------------------
+    if primary_failed_for_fallback:
+        try:
+            fallback_response = requests.get(
+                "https://apiv1.aethercloud.web.id/check",
+                params={"domain": domain},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+                timeout=TIMEOUT,
+                allow_redirects=False,
+            )
+
+            if fallback_response.status_code != 200:
+                result["error"] = (
+                    f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+                    f"fallback HTTP {fallback_response.status_code}."
+                )
+                return result
+
+            try:
+                fallback_payload = fallback_response.json()
+            except ValueError:
+                result["error"] = (
+                    f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+                    "fallback mengembalikan respons non-JSON."
+                )
+                return result
+
+            rows = (
+                fallback_payload.get("results", [])
+                if isinstance(fallback_payload, dict)
+                else []
+            )
+
+            domain_key = domain.lower().rstrip(".")
+            matched = None
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_domain = str(row.get("domain", "")).lower().rstrip(".")
+                if row_domain == domain_key:
+                    matched = row
+                    break
+
+            if matched is None and len(rows) == 1 and isinstance(rows[0], dict):
+                matched = rows[0]
+
+            if isinstance(matched, dict):
+                fallback_status = matched.get("status")
+
+                if set_blocked(fallback_status):
+                    result["provider"] = "AetherCloud (fallback)"
+                    result["fallback_used"] = True
+                    result["http_status"] = fallback_response.status_code
+                    return result
+
+                normalized_status = str(fallback_status or "").strip().upper()
+                if normalized_status in {"UNKNOWN", "ERROR"}:
+                    result["provider"] = "AetherCloud (fallback)"
+                    result["fallback_used"] = True
+                    result["http_status"] = fallback_response.status_code
+                    result["status"] = "UNKNOWN"
+                    result["error"] = (
+                        f"Fallback mengembalikan status {normalized_status or 'UNKNOWN'}."
+                    )
+                    return result
+
+            result["error"] = (
+                f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+                "fallback tidak mengembalikan status domain yang dapat dibaca."
+            )
+
+        except requests.Timeout:
+            result["error"] = (
+                f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; fallback timeout."
+            )
+        except requests.RequestException:
+            result["error"] = (
+                f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+                "fallback tidak dapat dihubungi."
+            )
+        except Exception as exc:
+            result["error"] = (
+                f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+                f"fallback gagal: {exc}"
+            )
 
     return result
 
@@ -3100,8 +3237,8 @@ def check_nawala_status(domain: str):
 st.divider()
 st.subheader("Nawala / Indonesia Block Check")
 st.caption(
-    "Cek status akses/blokir domain di Indonesia melalui NawalaCheck. "
-    "NawalaCheck adalah provider pihak ketiga, bukan API resmi Komdigi."
+    "Cek status akses/blokir domain di Indonesia melalui provider checker pihak ketiga. "
+    "NawalaCheck digunakan sebagai sumber utama; fallback hanya dipakai bila endpoint utama tidak tersedia."
 )
 
 nawala_domain_input = st.text_input(
@@ -3152,12 +3289,18 @@ if nawala_result:
         )
     elif nawala_result.get("error"):
         st.warning(nawala_result["error"])
-    elif blocked is True:
+    elif nawala_result.get("fallback_used"):
+        st.info(
+            "Endpoint NawalaCheck utama tidak tersedia pada request ini, jadi status diambil dari "
+            "provider fallback yang ditampilkan pada kolom Provider."
+        )
+
+    if blocked is True:
         st.error("Provider melaporkan domain ini sebagai DIBLOKIR pada pengecekan akses Indonesia.")
     elif blocked is False:
         st.success("Provider tidak melaporkan domain ini sebagai terblokir pada pengecekan saat ini.")
 
     st.caption(
-        "Hasil ini mengikuti respons NawalaCheck pada waktu pengecekan dan bukan keputusan resmi hukum/regulator. "
-        "Gunakan sebagai sinyal monitoring tambahan, bukan satu-satunya dasar keputusan."
+        "Hasil ini mengikuti respons provider yang ditampilkan pada waktu pengecekan dan bukan keputusan resmi "
+        "hukum/regulator. Gunakan sebagai sinyal monitoring tambahan, bukan satu-satunya dasar keputusan."
     )
