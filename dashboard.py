@@ -2995,10 +2995,9 @@ def check_nawala_status(domain: str):
     """
     Cek status blokir domain Indonesia.
 
-    Urutan provider:
+    Urutan:
     1. NawalaCheck (utama, memakai NAWALA_API_KEY)
-    2. Skiddle Nawala checker (fallback JSON)
-    3. AetherCloud Nawala checker (fallback terakhir)
+    2. TrustPositif unofficial public API (fallback)
 
     Fungsi ini hanya membaca status dari provider eksternal.
     """
@@ -3052,11 +3051,12 @@ def check_nawala_status(domain: str):
 
     # =====================================================
     # 1) PRIMARY - NawalaCheck
+    # Dokumentasi publik:
     # GET /api?domain=example.com
     # Header: X-API-Key
     # =====================================================
     try:
-        response = requests.get(
+        primary_response = requests.get(
             "https://nawalacheck.com/api",
             params={"domain": domain},
             headers={
@@ -3068,12 +3068,12 @@ def check_nawala_status(domain: str):
             allow_redirects=False,
         )
 
-        result["primary_http_status"] = response.status_code
-        result["http_status"] = response.status_code
+        result["primary_http_status"] = primary_response.status_code
+        result["http_status"] = primary_response.status_code
 
-        if response.status_code == 200:
+        if primary_response.status_code == 200:
             try:
-                payload = response.json()
+                payload = primary_response.json()
             except ValueError:
                 payload = None
 
@@ -3093,14 +3093,14 @@ def check_nawala_status(domain: str):
                 result["provider"] = "NawalaCheck"
                 return result
 
-        elif response.status_code in (401, 403):
+        elif primary_response.status_code in (401, 403):
             result["error"] = (
                 "NawalaCheck menolak API key/request. Periksa NAWALA_API_KEY, "
                 "status akun, limit, atau whitelist IP."
             )
             return result
 
-        elif response.status_code == 429:
+        elif primary_response.status_code == 429:
             result["error"] = (
                 "Limit request NawalaCheck tercapai. Coba lagi setelah limit provider reset."
             )
@@ -3112,18 +3112,15 @@ def check_nawala_status(domain: str):
         pass
 
     # =====================================================
-    # 2) FALLBACK - Skiddle Nawala checker
-    # GET /?domain=example.com&json=true
-    # Expected JSON:
-    # {"example.com":{"blocked":false}}
+    # 2) FALLBACK - TrustPositif unofficial public API
+    # Dokumentasi:
+    # GET https://trustpositif.glng.my.id/check/{domain}
+    # Response:
+    # {"domain":"example.com","blocked":false,"timestamp":"..."}
     # =====================================================
     try:
-        response = requests.get(
-            "https://check.skiddle.id/",
-            params={
-                "domain": domain,
-                "json": "true",
-            },
+        fallback_response = requests.get(
+            f"https://trustpositif.glng.my.id/check/{domain}",
             headers={
                 "Accept": "application/json",
                 "User-Agent": USER_AGENT,
@@ -3132,102 +3129,53 @@ def check_nawala_status(domain: str):
             allow_redirects=False,
         )
 
-        if response.status_code == 200:
+        if fallback_response.status_code == 200:
             try:
-                payload = response.json()
+                payload = fallback_response.json()
             except ValueError:
                 payload = None
 
-            domain_key = domain.lower().rstrip(".")
-            row = None
-
-            if isinstance(payload, dict):
-                row = payload.get(domain_key) or payload.get(domain)
-
-                if row is None:
-                    for key, value in payload.items():
-                        if str(key).lower().rstrip(".") == domain_key:
-                            row = value
-                            break
-
-            if isinstance(row, dict) and apply_blocked(row.get("blocked")):
-                result["provider"] = "Skiddle (fallback)"
+            if isinstance(payload, dict) and apply_blocked(payload.get("blocked")):
+                result["provider"] = "TrustPositif (fallback)"
                 result["fallback_used"] = True
-                result["http_status"] = response.status_code
+                result["http_status"] = fallback_response.status_code
                 return result
 
-    except requests.RequestException:
-        pass
-    except Exception:
-        pass
+        elif fallback_response.status_code == 429:
+            result["provider"] = "TrustPositif (fallback)"
+            result["fallback_used"] = True
+            result["http_status"] = fallback_response.status_code
+            result["error"] = "Fallback TrustPositif terkena rate limit. Coba lagi sekitar 1 menit."
+            return result
 
-    # =====================================================
-    # 3) FALLBACK TERAKHIR - AetherCloud
-    # GET /check?domain=example.com
-    # Expected status: SAFE / BLOCKED / UNKNOWN / ERROR
-    # =====================================================
-    try:
-        response = requests.get(
-            "https://apiv1.aethercloud.web.id/check",
-            params={"domain": domain},
-            headers={
-                "Accept": "application/json",
-                "User-Agent": USER_AGENT,
-            },
-            timeout=TIMEOUT,
-            allow_redirects=False,
+        result["provider"] = "TrustPositif (fallback)"
+        result["fallback_used"] = True
+        result["http_status"] = fallback_response.status_code
+        result["error"] = (
+            f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+            f"fallback TrustPositif HTTP {fallback_response.status_code}."
         )
 
-        if response.status_code == 200:
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = None
-
-            rows = (
-                payload.get("results", [])
-                if isinstance(payload, dict)
-                else []
-            )
-
-            domain_key = domain.lower().rstrip(".")
-            row = None
-
-            for item in rows:
-                if not isinstance(item, dict):
-                    continue
-
-                item_domain = str(item.get("domain", "")).lower().rstrip(".")
-                if item_domain == domain_key:
-                    row = item
-                    break
-
-            if row is None and len(rows) == 1 and isinstance(rows[0], dict):
-                row = rows[0]
-
-            if isinstance(row, dict) and apply_blocked(row.get("status")):
-                result["provider"] = "AetherCloud (fallback)"
-                result["fallback_used"] = True
-                result["http_status"] = response.status_code
-                return result
-
-    except requests.RequestException:
-        pass
-    except Exception:
-        pass
-
-    # Semua provider gagal memberikan verdict yang bisa dibaca.
-    primary_code = result.get("primary_http_status")
-
-    if primary_code:
+    except requests.Timeout:
+        result["provider"] = "TrustPositif (fallback)"
+        result["fallback_used"] = True
         result["error"] = (
-            f"NawalaCheck HTTP {primary_code}; provider fallback juga tidak dapat "
-            "memberikan status AMAN/DIBLOKIR."
+            f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+            "fallback TrustPositif timeout."
         )
-    else:
+    except requests.RequestException:
+        result["provider"] = "TrustPositif (fallback)"
+        result["fallback_used"] = True
         result["error"] = (
-            "Semua provider Nawala saat ini tidak dapat memberikan status "
-            "AMAN/DIBLOKIR."
+            f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+            "fallback TrustPositif tidak dapat dihubungi."
+        )
+    except Exception as exc:
+        result["provider"] = "TrustPositif (fallback)"
+        result["fallback_used"] = True
+        result["error"] = (
+            f"NawalaCheck HTTP {result.get('primary_http_status') or '-'}; "
+            f"fallback TrustPositif gagal: {exc}"
         )
 
     result["status"] = "UNKNOWN"
