@@ -1,4 +1,4 @@
-
+import csv
 import io
 import ipaddress
 import json
@@ -44,7 +44,7 @@ BULK_SCAN_WINDOW_SECONDS = 60
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151 Safari/537.36 DomainCheckerPro/8.1"
+    "Chrome/151 Safari/537.36 DomainCheckerPro/8.2"
 )
 
 session = requests.Session()
@@ -3357,7 +3357,7 @@ with main_tabs[0]:
             )
 
             lines = [
-                "DOMAIN CHECKER PRO V8.1 REPORT",
+                "DOMAIN CHECKER PRO V8.2 REPORT",
                 f"Domain: {report['domain']}",
                 f"Checked: {report['checked_at']}",
                 f"Health Score: {report['health']['score']}/100",
@@ -3468,19 +3468,23 @@ with main_tabs[1]:
     if rows:
         st.dataframe(rows, width="stretch", hide_index=True)
 
-        csv_buf = io.StringIO()
-        fieldnames = list(rows[0].keys())
-        writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+        try:
+            import csv as _csv
+            csv_buf = io.StringIO()
+            fieldnames = list(rows[0].keys())
+            writer = _csv.DictWriter(csv_buf, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
-        st.download_button(
-            "Download Bulk Results CSV",
-            data=csv_buf.getvalue(),
-            file_name="bulk_domain_results.csv",
-            mime="text/csv",
-            width="content",
-        )
+            st.download_button(
+                "Download Bulk Results CSV",
+                data=csv_buf.getvalue(),
+                file_name="bulk_domain_results.csv",
+                mime="text/csv",
+                width="content",
+            )
+        except Exception as exc:
+            st.warning(f"Bulk CSV export belum dapat dibuat: {exc}")
 
 
 with main_tabs[2]:
@@ -3491,18 +3495,22 @@ with main_tabs[2]:
     else:
         st.dataframe(history, width="stretch", hide_index=True)
 
-        csv_buf = io.StringIO()
-        writer = csv.DictWriter(csv_buf, fieldnames=history[0].keys())
-        writer.writeheader()
-        writer.writerows(history)
+        try:
+            import csv as _csv
+            csv_buf = io.StringIO()
+            writer = _csv.DictWriter(csv_buf, fieldnames=list(history[0].keys()))
+            writer.writeheader()
+            writer.writerows(history)
 
-        st.download_button(
-            "Download History CSV",
-            data=csv_buf.getvalue(),
-            file_name="domain_checker_history.csv",
-            mime="text/csv",
-            width="content",
-        )
+            st.download_button(
+                "Download History CSV",
+                data=csv_buf.getvalue(),
+                file_name="domain_checker_history.csv",
+                mime="text/csv",
+                width="content",
+            )
+        except Exception as exc:
+            st.warning(f"History CSV export belum dapat dibuat: {exc}")
 
         if st.button("Clear Session History", width="content"):
             st.session_state["scan_history"] = []
