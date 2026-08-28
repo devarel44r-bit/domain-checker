@@ -44,7 +44,7 @@ BULK_SCAN_WINDOW_SECONDS = 60
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151 Safari/537.36 DomainCheckerPro/8.2"
+    "Chrome/151 Safari/537.36 DomainCheckerPro/9.0"
 )
 
 session = requests.Session()
@@ -3165,6 +3165,447 @@ def run_bulk_scans_parallel(domains, include_nawala=False, max_workers=BULK_MAX_
             rows[idx] = row
 
     return rows
+
+
+# =========================================================
+# AUTHENTICATION / SUPABASE ACCESS GATE (V9)
+# =========================================================
+# Authentication is intentionally inserted immediately before the original
+# dashboard UI. Existing checker functions above remain unchanged.
+
+
+def _auth_secret(name: str):
+    try:
+        value = st.secrets[name]
+        return str(value).strip() if value is not None else ""
+    except Exception:
+        return ""
+
+
+SUPABASE_URL = _auth_secret("SUPABASE_URL").rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = _auth_secret("SUPABASE_PUBLISHABLE_KEY")
+SUPABASE_SECRET_KEY = _auth_secret("SUPABASE_SECRET_KEY")
+MASTER_EMAIL = _auth_secret("MASTER_EMAIL").lower()
+
+
+def _supabase_ready():
+    return bool(
+        SUPABASE_URL
+        and SUPABASE_PUBLISHABLE_KEY
+        and SUPABASE_SECRET_KEY
+        and not any(
+            placeholder in value.lower()
+            for value in (SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY)
+            for placeholder in ("xxxx", "example", "your_")
+        )
+    )
+
+
+def _sb_public_headers(access_token=None):
+    headers = {
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    # New Supabase publishable/secret API keys belong in `apikey`, while a
+    # signed-in user's JWT belongs in Authorization.
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    return headers
+
+
+def _sb_admin_headers():
+    # sb_secret_* is a backend key and bypasses RLS. Never render/return it.
+    # Use an explicit server UA: new Supabase secret keys are intentionally
+    # rejected when they appear to be used directly from a browser.
+    return {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "DomainCheckerPro/9.0 Streamlit-Server",
+    }
+
+
+def _sb_error_message(response, fallback="Supabase request gagal."):
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        for key in ("msg", "message", "error_description", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return fallback
+
+
+def supabase_sign_up(email: str, password: str, username: str, phone: str):
+    response = requests.post(
+        f"{SUPABASE_URL}/auth/v1/signup",
+        headers=_sb_public_headers(),
+        json={
+            "email": email,
+            "password": password,
+            "data": {
+                "username": username,
+                "phone": phone,
+            },
+        },
+        timeout=TIMEOUT,
+    )
+    if response.status_code not in (200, 201):
+        raise ValueError(_sb_error_message(response, "Pendaftaran gagal."))
+    return response.json()
+
+
+def supabase_sign_in(email: str, password: str):
+    response = requests.post(
+        f"{SUPABASE_URL}/auth/v1/token",
+        params={"grant_type": "password"},
+        headers=_sb_public_headers(),
+        json={"email": email, "password": password},
+        timeout=TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise ValueError(_sb_error_message(response, "Email/username atau password salah."))
+    return response.json()
+
+
+def supabase_refresh_session(refresh_token: str):
+    response = requests.post(
+        f"{SUPABASE_URL}/auth/v1/token",
+        params={"grant_type": "refresh_token"},
+        headers=_sb_public_headers(),
+        json={"refresh_token": refresh_token},
+        timeout=TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise ValueError("Sesi login sudah berakhir. Silakan login lagi.")
+    return response.json()
+
+
+def supabase_fetch_own_profile(user_id: str, access_token: str):
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/profiles",
+        headers=_sb_public_headers(access_token),
+        params={
+            "id": f"eq.{user_id}",
+            "select": "id,username,email,phone,role,is_active,created_at,last_login",
+            "limit": "1",
+        },
+        timeout=TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise ValueError(_sb_error_message(response, "Profil user tidak dapat dimuat."))
+    rows = response.json()
+    return rows[0] if isinstance(rows, list) and rows else None
+
+
+def supabase_admin_find_profile(field: str, value: str):
+    if field not in {"username", "email", "phone", "id"}:
+        return None
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/profiles",
+        headers=_sb_admin_headers(),
+        params={
+            field: f"eq.{value}",
+            "select": "id,username,email,phone,role,is_active,created_at,last_login",
+            "limit": "1",
+        },
+        timeout=TIMEOUT,
+    )
+    if response.status_code != 200:
+        return None
+    rows = response.json()
+    return rows[0] if isinstance(rows, list) and rows else None
+
+
+def supabase_admin_list_profiles():
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/profiles",
+        headers=_sb_admin_headers(),
+        params={
+            "select": "id,username,email,phone,role,is_active,created_at,last_login",
+            "order": "created_at.desc",
+            "limit": "1000",
+        },
+        timeout=TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise ValueError(_sb_error_message(response, "Daftar user tidak dapat dimuat."))
+    rows = response.json()
+    return rows if isinstance(rows, list) else []
+
+
+def supabase_admin_touch_last_login(user_id: str):
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/profiles",
+            headers={**_sb_admin_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{user_id}"},
+            json={"last_login": datetime.now(timezone.utc).isoformat()},
+            timeout=TIMEOUT,
+        )
+    except Exception:
+        pass
+
+
+def _normalize_registration_phone(value: str):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    has_plus = value.startswith("+")
+    digits = re.sub(r"\D", "", value)
+    return ("+" if has_plus else "") + digits
+
+
+def _resolve_login_email(login_value: str):
+    login_value = (login_value or "").strip()
+    if "@" in login_value:
+        return login_value.lower()
+    profile = supabase_admin_find_profile("username", login_value)
+    if profile and profile.get("email"):
+        return str(profile["email"]).lower()
+    # Keep the outward login error generic.
+    return ""
+
+
+def _is_admin(profile, user):
+    role = str((profile or {}).get("role") or "").strip().lower()
+    email = str((user or {}).get("email") or "").strip().lower()
+    return role == "admin" or (MASTER_EMAIL and email == MASTER_EMAIL)
+
+
+def _clear_auth_session():
+    for key in ("auth_session", "auth_user", "auth_profile", "auth_is_admin"):
+        st.session_state.pop(key, None)
+
+
+for _key, _default in {
+    "auth_session": None,
+    "auth_user": None,
+    "auth_profile": None,
+    "auth_is_admin": False,
+}.items():
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
+
+
+if not _supabase_ready():
+    st.error(
+        "Supabase belum terkonfigurasi. Isi SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, "
+        "dan SUPABASE_SECRET_KEY di Streamlit Secrets."
+    )
+    st.stop()
+
+
+# Refresh expired/near-expired sessions before rendering protected content.
+_auth_session = st.session_state.get("auth_session")
+if _auth_session:
+    try:
+        expires_at = int(_auth_session.get("expires_at") or 0)
+    except Exception:
+        expires_at = 0
+
+    if expires_at and expires_at <= int(time.time()) + 60:
+        try:
+            refreshed = supabase_refresh_session(_auth_session.get("refresh_token") or "")
+            st.session_state["auth_session"] = refreshed
+            st.session_state["auth_user"] = refreshed.get("user")
+            _auth_session = refreshed
+        except Exception:
+            _clear_auth_session()
+            _auth_session = None
+
+
+# =========================================================
+# PUBLIC LOGIN / REGISTER PAGE
+# =========================================================
+if not st.session_state.get("auth_session"):
+    st.markdown(
+        """
+        <div class="dc-hero">
+            <div class="dc-eyebrow">SECURE ACCESS</div>
+            <div class="dc-title">DOMAIN CHECKER</div>
+            <div class="dc-subtitle">
+                Login atau buat akun terlebih dahulu untuk mengakses Domain Checker.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    login_tab, register_tab = st.tabs(["Login", "Daftar"])
+
+    with login_tab:
+        with st.form("domain_checker_login_form", clear_on_submit=False):
+            login_value = st.text_input("Email atau Username", placeholder="email@example.com atau username")
+            login_password = st.text_input("Password", type="password")
+            login_submit = st.form_submit_button("Login", width="stretch")
+
+        if login_submit:
+            try:
+                email_value = _resolve_login_email(login_value)
+                if not email_value or not login_password:
+                    raise ValueError("Email/username atau password salah.")
+
+                auth_data = supabase_sign_in(email_value, login_password)
+                user = auth_data.get("user") or {}
+                user_id = user.get("id")
+                access_token = auth_data.get("access_token")
+                if not user_id or not access_token:
+                    raise ValueError("Login gagal. Sesi user tidak tersedia.")
+
+                profile = supabase_fetch_own_profile(user_id, access_token)
+                if not profile:
+                    raise ValueError("Profil akun belum tersedia.")
+                if profile.get("is_active") is False:
+                    raise ValueError("Akun ini sedang dinonaktifkan.")
+
+                st.session_state["auth_session"] = auth_data
+                st.session_state["auth_user"] = user
+                st.session_state["auth_profile"] = profile
+                st.session_state["auth_is_admin"] = _is_admin(profile, user)
+                supabase_admin_touch_last_login(user_id)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    with register_tab:
+        with st.form("domain_checker_register_form", clear_on_submit=False):
+            reg_username = st.text_input("Username", placeholder="username")
+            reg_email = st.text_input("Email", placeholder="email@example.com")
+            reg_phone = st.text_input("Nomor telepon", placeholder="+855xxxxxxxx")
+            reg_password = st.text_input("Password", type="password")
+            reg_confirm = st.text_input("Konfirmasi password", type="password")
+            register_submit = st.form_submit_button("Buat Akun", width="stretch")
+
+        if register_submit:
+            try:
+                allowed, wait_seconds = check_rate_limit("register_attempt_times", 5, 600)
+                if not allowed:
+                    raise ValueError(f"Terlalu banyak percobaan daftar. Coba lagi sekitar {wait_seconds} detik.")
+
+                username = (reg_username or "").strip()
+                email = (reg_email or "").strip().lower()
+                phone = _normalize_registration_phone(reg_phone)
+
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username):
+                    raise ValueError("Username harus 3-32 karakter dan hanya boleh huruf, angka, _, titik, atau -.")
+                if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+                    raise ValueError("Format email tidak valid.")
+                if len(re.sub(r"\D", "", phone)) < 7 or len(re.sub(r"\D", "", phone)) > 18:
+                    raise ValueError("Nomor telepon tidak valid.")
+                if len(reg_password or "") < 8:
+                    raise ValueError("Password minimal 8 karakter.")
+                if not re.search(r"[A-Za-z]", reg_password or "") or not re.search(r"\d", reg_password or ""):
+                    raise ValueError("Password harus mengandung minimal 1 huruf dan 1 angka.")
+                if reg_password != reg_confirm:
+                    raise ValueError("Konfirmasi password tidak sama.")
+
+                # Friendly duplicate checks. Only boolean existence is exposed to UI.
+                if supabase_admin_find_profile("username", username):
+                    raise ValueError("Username sudah digunakan.")
+                if supabase_admin_find_profile("email", email):
+                    raise ValueError("Email sudah terdaftar.")
+                if supabase_admin_find_profile("phone", phone):
+                    raise ValueError("Nomor telepon sudah digunakan.")
+
+                signup_data = supabase_sign_up(email, reg_password, username, phone)
+                if signup_data.get("access_token"):
+                    st.success("Akun berhasil dibuat. Silakan buka tab Login dan masuk menggunakan akun baru.")
+                else:
+                    st.success("Akun berhasil dibuat. Cek email untuk konfirmasi, lalu kembali dan login.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    st.caption("Password disimpan dan dikelola oleh Supabase Auth; dashboard tidak menyimpan atau menampilkan password user.")
+    st.stop()
+
+
+# =========================================================
+# AUTHENTICATED USER CONTEXT
+# =========================================================
+_auth_session = st.session_state.get("auth_session") or {}
+_auth_user = st.session_state.get("auth_user") or _auth_session.get("user") or {}
+_access_token = _auth_session.get("access_token")
+_user_id = _auth_user.get("id")
+
+try:
+    if _user_id and _access_token:
+        _profile = supabase_fetch_own_profile(_user_id, _access_token)
+        if _profile:
+            st.session_state["auth_profile"] = _profile
+            st.session_state["auth_is_admin"] = _is_admin(_profile, _auth_user)
+except Exception:
+    _profile = st.session_state.get("auth_profile") or {}
+else:
+    _profile = st.session_state.get("auth_profile") or {}
+
+if _profile.get("is_active") is False:
+    _clear_auth_session()
+    st.error("Akun ini sedang dinonaktifkan.")
+    st.stop()
+
+
+with st.sidebar:
+    st.markdown("### Account")
+    st.write(f"**{fmt(_profile.get('username'), 'User')}**")
+    st.caption(fmt(_auth_user.get("email"), "-"))
+    if st.session_state.get("auth_is_admin"):
+        st.success("MASTER ADMIN")
+    if st.button("Logout", key="auth_logout_button", width="stretch"):
+        _clear_auth_session()
+        st.rerun()
+
+
+# Admin data lives behind both authenticated access and an admin/master check.
+if st.session_state.get("auth_is_admin"):
+    with st.expander("🔐 Master Admin · User Management", expanded=False):
+        try:
+            admin_rows = supabase_admin_list_profiles()
+            total_users = len(admin_rows)
+            active_users = sum(1 for row in admin_rows if row.get("is_active") is True)
+            admin_users = sum(1 for row in admin_rows if str(row.get("role") or "").lower() == "admin")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Users", total_users)
+            c2.metric("Active Users", active_users)
+            c3.metric("Admins", admin_users)
+
+            display_rows = [
+                {
+                    "username": row.get("username"),
+                    "email": row.get("email"),
+                    "phone": row.get("phone"),
+                    "role": row.get("role"),
+                    "active": row.get("is_active"),
+                    "registered": row.get("created_at"),
+                    "last_login": row.get("last_login"),
+                    "user_id": row.get("id"),
+                }
+                for row in admin_rows
+            ]
+            st.dataframe(display_rows, width="stretch", hide_index=True)
+
+            if display_rows:
+                admin_csv = io.StringIO()
+                writer = csv.DictWriter(admin_csv, fieldnames=list(display_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(display_rows)
+                st.download_button(
+                    "Download Users CSV",
+                    data=admin_csv.getvalue(),
+                    file_name="domain_checker_users.csv",
+                    mime="text/csv",
+                    width="content",
+                )
+
+            st.caption("Password user tidak tersedia di Admin Panel karena dikelola oleh Supabase Auth.")
+        except Exception as exc:
+            st.warning(f"Admin data belum dapat dimuat: {exc}")
 
 
 # =========================================================
